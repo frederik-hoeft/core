@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/Solution Items/">
+    <File Path=".editorconfig" />
+    <File Path="Directory.Build.props" />
+  </Folder>
+  <Project Path="Fho.Core.Threading.Tests/Fho.Core.Threading.Tests.csproj" Id="47a0b216-2f15-425f-802a-e22743e8fbe5" />
+  <Project Path="Fho.Core.Threading/Fho.Core.Threading.csproj" />
+</Solution>
