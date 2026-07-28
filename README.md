@@ -10,7 +10,7 @@ A .NET 10 library providing low-level threading and concurrency utilities: an as
 
 Disposal is orderly: it atomically marks the lock disposed, cancels any pending waiters, drains the waiter count, and then disposes the semaphore. Disposal races are normalized into `LockDisposedException` rather than surfacing `ObjectDisposedException` from the underlying primitive.
 
-`AsyncAlphaBetaLock` combines the two-group semantics of `AlphaBetaLockSlim` (same-group concurrency, cross-group exclusion, alpha admission precedence) with the async-flow reentrancy and dispose model of `AsyncLock`. Waiters park on `TaskCompletionSource` gates rather than blocking threads, so it is safe for async-heavy scenarios such as coordinating access to shared singleton services from ASP.NET controllers. Beta reentrancy is granted even while an alpha is waiting, preventing nested beta work from deadlocking against alpha precedence. See `docs/architecture/async-alpha-beta-lock.md` for the state machine and race catalog.
+`AsyncAlphaBetaLock` combines the two-group semantics of `AlphaBetaLockSlim` (same-group concurrency, cross-group exclusion, alpha admission precedence) with async-native waiting and generation-scoped async-flow reentrancy. Work is submitted only through structured `Run*`/`TryRun*` methods. Waiters park on `TaskCompletionSource` gates rather than blocking threads, and disposal seals admission and wakes waiters without synchronously draining async continuations. Active beta ownership generations may reenter while alpha is waiting, preventing nested beta work from deadlocking against alpha precedence. See `docs/architecture/async-alpha-beta-lock.md` for the state machine and race catalog.
 
 ### Pessimistic locking
 
