@@ -2,199 +2,137 @@
 
 Location: `source/Fho.Core/Fho.Core.Threading/Async/AsyncAlphaBetaLock.cs`
 
-## Why it exists
+## Purpose and public contract
 
-`AlphaBetaLockSlim` gives two-group (alpha / beta) mutual exclusion with same-group concurrency and alpha admission precedence, but it is fully synchronous: waiters block threads, ownership is thread-affine, and recursion is forbidden. That makes it a poor fit for async ASP.NET-style code that synchronizes access to shared singleton services across `await` points.
+`AsyncAlphaBetaLock` combines the two-group semantics of `AlphaBetaLockSlim` with async-native waiting and async-flow reentrancy:
 
-`AsyncLock` is async-native (SemaphoreSlim + AsyncLocal reentrancy + orderly dispose), but it is strict mutual exclusion — only one async flow at a time.
+- operations in the same group may execute concurrently;
+- alpha and beta operations never overlap;
+- a registered alpha waiter blocks new beta ownership generations;
+- an already active ownership generation may reenter its own group, including beta while alpha waits;
+- cross-group reentrancy is rejected with `InvalidOperationException`;
+- callers submit work only through `Run*` and `TryRun*`; there is no manual acquire/release API;
+- caller cancellation aborts admission, including a pre-canceled reentrant call;
+- disposal seals new ownership generations, wakes queued operations, and never blocks waiting for async continuations;
+- operations already admitted before disposal may finish and reenter their existing generation.
 
-`AsyncAlphaBetaLock` combines both:
+`TryRun*` returns `TaskExecuted: false` only when disposal prevents admission. Exceptions thrown by user work, including `LockDisposedException`, propagate unchanged.
 
-| Concern | Behavior |
-|---|---|
-| Same-group holders | Concurrent |
-| Cross-group holders | Mutually exclusive |
-| Alpha vs beta admission | Alpha wins: a waiting alpha blocks *new* beta entry |
-| Reentrancy | Allowed for the same group on the same async flow (AsyncLocal depth) |
-| Beta reentry under waiting alpha | Allowed (avoids deadlock with outer beta frame) |
-| Cross-group upgrade | Forbidden (`InvalidOperationException`) |
-| Waiting | `TaskCompletionSource` gates — no thread blocked on the lock |
-| Disposal | Cancels waiters, drains in-flight enters, holders may still exit |
+## Shared state
 
-It is **not** a thin async wrapper around `AlphaBetaLockSlim`. The state machine is built on BCL async primitives so waiters do not consume thread-pool workers.
+A short `lock (_stateGuard)` protects:
 
-## Mental model
-
-Think of two compatible clubs that cannot share the building:
-
-- Any number of **alphas** may be inside together.
-- Any number of **betas** may be inside together.
-- Alphas and betas may never be inside at the same time.
-- If an alpha is *in line*, the bouncer stops admitting new betas (even while betas are still inside). Existing betas may re-enter (bathroom break) so they can finish and leave.
-- When the building empties, alphas in line go first.
-
-## Public API shape
-
-Mirrors `AsyncLock`, doubled for the two groups:
-
-- **Run\* / Run\*Task\*** — acquire, run sync or async work, release in `finally`. Preferred.
-- **TryRun\*** — same, but concurrent dispose yields `AsyncLockResult` with `TaskExecuted: false` instead of throwing `LockDisposedException`.
-- **AcquireAlphaAsync / AcquireBetaAsync** — low-level `IDisposable` scope for `await using` / `using` patterns. Prefer Run\* when possible.
-- **IsAlphaHeld / IsBetaHeld** — current async-flow ownership.
-- **CurrentAlphaCount / CurrentBetaCount / WaitingAlphaCount / WaitingBetaCount** — diagnostics (approximate under concurrency).
-- **Dispose** — fail future acquires; cancel and drain waiters.
-
-## State machine
-
-All shared mutable state is guarded by a short `lock (_stateGuard)` that is **never held across an await**.
-
-```
-_alphaHolders, _betaHolders   // outermost acquisitions only (not reentrancy depth)
-_alphaWaiters, _betaWaiters   // flows parked or about to park
-_alphaGate, _betaGate         // single-shot TaskCompletionSource per generation
-_disposedValue                // AtomicBoolean
-_waitingCount                 // in-flight EnterCoreAsync attempts (for dispose drain)
-_al_alphaDepth, _al_betaDepth // AsyncLocal reentrancy per flow
+```text
+_alphaHolders, _betaHolders
+_alphaWaiters, _betaWaiters
+_alphaGate, _betaGate
+_disposedValue
 ```
 
-### Admission (`CanEnter`)
+The guard is never held across `await`. Gate completion happens after the guard is released and each gate uses `RunContinuationsAsynchronously`.
+
+Invariants under `_stateGuard`:
+
+```text
+!(_alphaHolders > 0 && _betaHolders > 0)
+_alphaHolders >= 0
+_betaHolders >= 0
+_alphaWaiters >= 0
+_betaWaiters >= 0
+```
+
+Admission predicates:
 
 | Request | Condition |
 |---|---|
 | Alpha | `_betaHolders == 0` |
 | Beta | `_alphaHolders == 0 && _alphaWaiters == 0` |
 
-Waiting betas do **not** block alpha. Waiting alphas **do** block new beta. Reentrancy never consults `CanEnter`.
+Waiting beta operations do not delay alpha. A waiting alpha immediately closes admission to new beta generations.
 
-### Ownership / reentrancy (two AsyncLocal channels)
+## Ownership generations
 
-| Channel | Type | Used by | Why |
-|---|---|---|---|
-| `_al_alphaDepth` / `_al_betaDepth` | `AsyncLocal<int>` | `Run*` | Same model as `AsyncLock`: nested work sees depth; concurrent sibling Runs from one parent do **not** share depths (writes don’t flow up). |
-| `_al_acquireOwnership` | `AsyncLocal<FlowOwnership?>` | `Acquire*` | Heap object published on the **caller** before any await so `Is*Held` / releaser / nested `Run*` see depth after `Acquire*` returns. |
+`AsyncLocal<OwnershipLease?>` carries the current ownership generation through `ExecutionContext`. The `AsyncLocal` value is only a reference; authority comes from synchronized state inside `OwnershipLease`:
 
-`GetTotalDepth` = run depth + acquire depth. Reentrancy (including beta under waiting alphas) and cross-group checks use the total. Only the outermost frame (total was 0) calls `EnterCoreAsync` / `ExitCore`.
+```text
+_isAlpha
+_activeOperations
+_active
+```
 
-### Enter sequence
+Every structured `Run*` invocation contributes one active-operation reference:
 
-1. If other-group total depth &gt; 0 → throw `InvalidOperationException`.
-2. If same-group total depth &gt; 0 → reentrant: bump the appropriate depth only (no shared-state wait).
-3. Otherwise `EnterCoreAsync`: `CheckDisposed`, then under `_stateGuard`: if `CanEnter`, bump holders and return; else bump waiters (alpha waiter immediately closes beta admission), snapshot current gate `Task`.
-4. `await gate.WaitAsync(linkedToken)` outside the lock.
-5. On wake, loop to step 3 (still registered as waiter until acquire or cancel).
-6. On cancel: unregister waiter; if last alpha waiter with no alpha holders, pulse betas; `CheckDisposed` (dispose → `LockDisposedException`) else rethrow `OperationCanceledException` / `TaskCanceledException`.
-7. After successful outermost enter, bump run or acquire depth for this frame.
+1. If the ambient lease is active for the requested group, `TryEnter` increments its reference count.
+2. If the ambient lease is active for the opposite group, the call fails.
+3. If no active lease exists, the call performs normal admission, creates a fresh lease generation, and publishes it for user work.
+4. In `finally`, the invocation decrements the lease count.
+5. The transition from one reference to zero marks the lease inactive and releases exactly one shared holder.
 
-### Exit sequence
+`TryEnter` and the final `Exit` are serialized by the lease guard. Therefore a concurrent nested call either joins before the active-to-inactive transition, keeping the shared holder alive, or observes an inactive lease and performs fresh admission.
 
-1. Decrement AsyncLocal depth.
-2. If depth hits 0, under `_stateGuard` decrement holders; if holders hit 0, select pulse target:
-   - alpha waiters present → take/clear `_alphaGate`
-   - else if beta waiters present → take/clear `_betaGate`
-3. `TrySetResult` **outside** `_stateGuard`.
+This handles two otherwise dangerous cases:
 
-### Pulse protocol
+- nested work may outlive the callback that created it without releasing cross-group exclusion early;
+- a child context may retain a copied `AsyncLocal` reference, but cannot use it after the generation becomes inactive.
 
-Gates are single-shot:
+Suppressing `ExecutionContext` flow removes the ambient lease and therefore removes reentrancy.
 
-1. Waiters await the current TCS.
-2. Pulser nulls the field and completes the old TCS outside the lock.
-3. Next waiter allocates a fresh incomplete TCS via `GetOrCreateGate`.
-4. All waiters re-check `CanEnter` after wake (no trust in the pulse alone).
+## Wait and handoff protocol
 
-`TaskCreationOptions.RunContinuationsAsynchronously` plus “complete outside the lock” prevents waiter continuations from running under `_stateGuard`.
+A denied operation registers once as a waiter and awaits its group's current single-shot `TaskCompletionSource` gate. A pulse detaches the gate, completes it outside `_stateGuard`, and causes all waiters on that generation to recheck admission.
 
-## Race catalog (maintainers)
+When the final holder exits:
 
-These are the races the implementation is written against. If you change the state machine, re-verify each.
+1. pulse alpha if any alpha waits;
+2. otherwise pulse beta if any beta waits.
 
-### 1. Dispose vs enter (TOC/TOU)
+If the last alpha waiter cancels while no alpha holds, the cancellation path pulses beta because the alpha admission barrier has disappeared.
 
-Enter checks disposed, then later takes `_stateGuard`. Dispose may CAS the flag in between. Under `_stateGuard`, enter re-checks disposed, unregisters if it had become a waiter, pulses betas if it was the last alpha waiter, then throws `LockDisposedException` **after** releasing `_stateGuard`.
+Cancellation is checked under `_stateGuard` before admission. If cancellation and handoff race, the first state transition observed under the guard determines whether the operation is admitted or canceled; it is never both.
 
-### 2. Dispose vs parked waiter
+## Disposal
 
-Dispose cancels `_cts` (unblocks `WaitAsync`) **and** pulses both gates (covers the lost-wakeup window where cancel has not yet been observed). Enter’s cancel path unregisters and converts dispose-cancel into `LockDisposedException`.
+`Dispose` performs only a bounded synchronous transition:
 
-### 3. Dispose vs holder
+1. under `_stateGuard`, set `_disposedValue` and detach both group gates;
+2. complete `_disposeGate` and the detached group gates outside the guard.
 
-Holders are not in `_waitingCount`. Dispose does not wait for them. `ExitCore` remains valid after dispose so `finally` blocks do not fault after successful work. New reentry on a still-held outer frame is also allowed (depth &gt; 0 fast path skips `CheckDisposed`) so nested work under an in-flight holder does not throw mid-section during teardown.
+Every parked operation waits for either its group gate or `_disposeGate`. The independent disposal gate covers the race where a normal handoff has detached a group gate but has not completed it yet when disposal occurs.
 
-### 4. Dispose drainage
+There is no `CancellationTokenSource` to dispose and no waiter-drain spin. Consequently disposal cannot deadlock a single-threaded `SynchronizationContext` or a constrained thread pool.
 
-`_waitingCount` covers every non-reentrant enter attempt. Dispose spins (`SpinWait.SpinUntil`) until it is zero before returning. This is the intentional short-term blocking exception called out in the product requirements — dispose is rare; orphaned waiters are not acceptable.
+A queued operation rechecks `_disposedValue` under `_stateGuard`, unregisters itself, and throws `LockDisposedException`. Existing ownership generations do not consult disposal on reentry and can complete their structured work safely.
 
-### 5. Cancel vs pulse
+## Linearization points
 
-If a waiter is both pulsed and cancelled, `WaitAsync` may throw `OperationCanceledException`. Cancellation wins: the flow unregisters and does not acquire. That is intentional; the caller asked to abort.
-
-### 6. Last alpha waiter cancels
-
-While an alpha is registered as a waiter, `CanEnter(beta)` is false. If that alpha cancels (or hits dispose) and it was the last alpha waiter with `_alphaHolders == 0`, betas would be stranded unless we pulse them. `UnregisterWaiter_NoLock` handles this.
-
-### 7. Alpha arrives while betas wait on an empty lock
-
-Alpha `CanEnter` only checks holders, not beta waiters, so alpha walks in immediately. Correct precedence; betas remain parked until alphas finish.
-
-### 8. Pulse then alpha sneaks in before beta re-acquires
-
-Last alpha exits → pulse betas → before a beta re-takes `_stateGuard`, a new alpha acquires (holders were 0, waiters 0). Beta wakes, `CanEnter` fails, re-waits. Alpha precedence holds.
-
-### 9. Beta reentry while alpha waits
-
-Outer beta holds (`_betaHolders ≥ 1`, flow depth ≥ 1). Alpha registers as waiter (`_alphaWaiters ≥ 1`) → new betas blocked. Nested beta `RunBeta*` on the same flow hits the depth fast path and proceeds without consulting `CanEnter`. Without this, the outer beta could never finish and alpha would wait forever (deadlock).
-
-### 10. Exception in user work
-
-`LockAsync` always `ExitLocal`s in `finally`. Holder counts cannot leak from user exceptions.
-
-### 11. Double-dispose / double-release of Acquire scope
-
-Dispose is idempotent via CAS on `_disposedValue`. `LockReleaser` uses `Interlocked.Exchange` so double-`Dispose` on the scope is a no-op.
-
-### 12. Thundering herd
-
-A pulse wakes all waiters of a group; each re-serializes on `_stateGuard` and admits if `CanEnter`. Same-group waiters typically all admit (no concurrency cap). This is simple and correct; fairness beyond alpha precedence is not guaranteed.
-
-## What this is not
-
-- **Not** a reader/writer lock. Both groups are “writer-like” relative to each other; neither is a pure reader tier with upgrade paths.
-- **Not** fair FIFO across groups. Alpha can starve beta by design (same as `AlphaBetaLockSlim`).
-- **Not** thread-affine. Ownership is async-flow-affine via `AsyncLocal`. Do not assume `Thread.CurrentThread` is stable across awaits inside a hold.
-- **Not** a wrapper over `AlphaBetaLockSlim` / `ReaderWriterLockSlim` / a blocking `Monitor.Wait`. Blocking waits on the hot path would defeat async scalability.
-
-## Implementation map
-
-| Piece | Role |
+| Operation | Linearization point |
 |---|---|
-| `EnterCoreAsync` | Admission + wait loop + cancel/dispose handling |
-| `ExitCore` / `SelectPulseTarget_NoLock` | Holder release + alpha-preferring wake |
-| `CanEnter_NoLock` | Group exclusivity + alpha precedence |
-| `LockAsync` / `ExitLocal` | Depth bookkeeping + guaranteed release |
-| `LockReleaser` | Acquire\* scope token |
-| `_waitingCount` + Dispose spin | Orphan-free teardown |
+| New admission | holder increment under `_stateGuard` |
+| Waiter registration | waiter increment under `_stateGuard` |
+| Cancellation before admission | canceled-state branch under `_stateGuard` |
+| Disposal | `_disposedValue = true` under `_stateGuard` |
+| Reentrant join | lease reference increment under `_leaseGuard` |
+| Final ownership release | lease active-to-inactive transition under `_leaseGuard` |
+| Group release | holder decrement under `_stateGuard` |
 
-## Testing expectations
+## Race checklist
 
-See `Fho.Core.Threading.Tests/Async/AsyncAlphaBetaLockTests.cs`. Tests use timeouts (typically via `CancellationTokenSource.CancelAfter` or `Task.WhenAny` with a delay) so a logic bug deadlocks the test harness rather than hanging CI forever. Coverage should include:
+Changes must preserve all of the following:
 
-- Same-group concurrency (alpha–alpha, beta–beta)
-- Cross-group exclusion
-- Alpha precedence over waiting / held beta
-- Beta reentrancy under waiting alpha
-- Cross-group rejection
-- Cancellation of waiters
-- Dispose vs waiters and Try\* skipped results
-- Exception safety (lock released)
-- Acquire\* scope dispose
+- escaped nested same-group work retains the shared holder;
+- stale inherited contexts cannot reenter a closed generation;
+- cross-group ownership never overlaps;
+- waiting alpha closes new beta admission;
+- beta reentry remains possible while alpha waits;
+- cancellation unregisters exactly once;
+- canceling the last alpha waiter can wake beta;
+- cancellation versus handoff has one outcome;
+- disposal versus entry has one outcome;
+- disposal wakes a gate detached by a concurrent handoff;
+- `TryRun*` catches only admission failure, never exceptions from user work;
+- no gate continuation runs under `_stateGuard`;
+- no public path synchronously waits for an async continuation.
 
-## Change checklist
+## Testing
 
-When editing the lock:
-
-1. Re-read the race catalog above.
-2. Keep `_stateGuard` sections tiny and await-free.
-3. Complete TCS gates only outside `_stateGuard`.
-4. Keep alpha waiter registration as the beta admission barrier (not only alpha holders).
-5. Keep the reentrancy fast path before any shared-state check.
-6. Run the full `AsyncAlphaBetaLockTests` suite; treat any timeout as a deadlock bug, not a flake, until proven otherwise.
+`AsyncAlphaBetaLockTests` uses explicit synchronization points and timeouts. Coverage includes same-group concurrency, cross-group exclusion, alpha precedence, beta reentry, escaped nested work, stale contexts, suppressed context flow, cancellation cleanup and races, non-blocking disposal, single-threaded-context disposal, user-exception propagation, and high-contention exclusion stress.
