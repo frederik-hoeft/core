@@ -5,4 +5,5 @@
   </Folder>
   <Project Path="Fho.Core.Threading.Tests/Fho.Core.Threading.Tests.csproj" Id="47a0b216-2f15-425f-802a-e22743e8fbe5" />
   <Project Path="Fho.Core.Threading/Fho.Core.Threading.csproj" />
+  <Project Path="Fho.Core/Fho.Core.csproj" Id="32fca315-2332-4c46-bd8a-1266258ab757" />
 </Solution>
