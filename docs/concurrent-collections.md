@@ -137,8 +137,14 @@ The empty/full metadata is part of the bitmap's maintained state, not a recomput
 
 This invariant is the main extension constraint for the bitmap tree. Adding a new mutation path without updating summary propagation can leave `IsEmpty`, `IsFull`, and higher-level state decisions inconsistent even if the user-visible data bits themselves were written correctly.
 
+## `ConcurrentBitmap2` (mostly lock-free redesign)
+
+`ConcurrentBitmap2` is a redesign aimed at the producer/consumer work-tracking pattern where `IsEmpty == true` must be authoritative. It stores bits in a flat array of guarded 56-bit words, tracks global emptiness with an atomic set-bit counter (increment-before-set / decrement-after-clear), and coordinates rare `Grow` / `RemoveBitAt` operations through a quiescence gate rather than a reader/writer lock on every point access.
+
+The hierarchical `ConcurrentBitmap` remains available for comparison. Full architecture, invariants, and the informal correctness argument live in [ConcurrentBitmap2 architecture](architecture/concurrent-bitmap2.md).
+
 ## Relationship between the collection designs
 
-`ConcurrentHashSet<T>` and `ConcurrentBitmap` intentionally do not share a common internal collection framework.
+`ConcurrentHashSet<T>`, `ConcurrentBitmap`, and `ConcurrentBitmap2` intentionally do not share a common internal collection framework.
 
-The hash set coordinates independent bucket chains through stable stripes and table replacement. The bitmap instead packs the leaf state into atomic words and adds a hierarchy whose metadata depends on child state. Their synchronization strategies follow those data models, and forcing them behind one shared locking abstraction would hide the invariants that make each implementation work.
+The hash set coordinates independent bucket chains through stable stripes and table replacement. The hierarchical bitmap packs leaf state into atomic words and adds summary metadata that depends on child state. `ConcurrentBitmap2` drops the summary tree in favor of a global counter and flat CAS words. Their synchronization strategies follow those data models, and forcing them behind one shared locking abstraction would hide the invariants that make each implementation work.

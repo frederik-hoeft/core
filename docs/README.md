@@ -8,5 +8,6 @@ This directory documents the architecture and concurrency contracts of Fho.Core.
 - [Synchronization](synchronization.md) covers `AsyncLock`, `AlphaBetaLockSlim`, scoped `ReaderWriterLockSlim` ownership, disposal, cancellation, and ownership semantics.
 - [Atomic primitives](atomic-primitives.md) covers `Atomic`, `AtomicBoolean`, and generic enum operations, including the compare-and-swap update model.
 - [Concurrent collections](concurrent-collections.md) covers `ConcurrentHashSet<T>`, the 56-bit guarded bitmap primitive, and the hierarchical `ConcurrentBitmap` built on top of it.
+- [ConcurrentBitmap2 architecture](architecture/concurrent-bitmap2.md) covers the mostly lock-free work-tracking bitmap, emptiness invariants, hot-path vs structural coordination, and the informal correctness argument.
 
 For local coding conventions, see [code-style.md](../code-style.md).

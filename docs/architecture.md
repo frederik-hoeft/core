@@ -50,7 +50,9 @@ The collection layer contains two unrelated designs optimized for different work
 
 `ConcurrentBitmap` is a hierarchical bit set built from guarded 56-bit atomic state words. Point updates modify the containing 64-bit word with CAS, while summary metadata tracks whether child regions are empty or full. Structural operations such as insertion, removal, growth, and shrinking take an exclusive topology lock because they can shift indices or replace nodes.
 
-See [Concurrent collections](concurrent-collections.md).
+`ConcurrentBitmap2` is a separate, mostly lock-free design for the same domain (work-tracking bitmaps). It uses a flat array of guarded 56-bit words, an atomic set-bit counter for authoritative emptiness, and a quiescence gate only for rare structural rewrites—without hierarchical summary locks or a per-operation topology RWLS.
+
+See [Concurrent collections](concurrent-collections.md) and [ConcurrentBitmap2 architecture](architecture/concurrent-bitmap2.md).
 
 ### Coordination and supporting contracts
 
