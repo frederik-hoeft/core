@@ -36,3 +36,12 @@ Disposal is orderly: it atomically marks the lock disposed, cancels any pending 
 |---|---|
 | `Fho.Core.Threading` | Library (net10.0, BCL-only dependencies) |
 | `Fho.Core.Threading.Tests` | MSTest 4 test suite |
+
+## Documentation
+
+Contributor-oriented architecture and concurrency documentation lives in [`docs/`](docs/README.md):
+
+- [Architecture overview](docs/architecture.md)
+- [Synchronization](docs/synchronization.md)
+- [Atomic primitives](docs/atomic-primitives.md)
+- [Concurrent collections](docs/concurrent-collections.md)
