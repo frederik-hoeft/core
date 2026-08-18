@@ -1,4 +1,4 @@
-using Fho.Core.Threading.Collections;
+﻿using Fho.Core.Threading.Collections;
 
 namespace Fho.Core.Threading.Tests.Collections;
 
@@ -10,6 +10,12 @@ public sealed class ConcurrentBitmap2Tests
     {
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new ConcurrentBitmap2(0));
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new ConcurrentBitmap2(-1));
+    }
+
+    [TestMethod]
+    public void BitRemovalInvalidatesTokens()
+    {
+        ConcurrentBitmap2 bmp = new(128);
     }
 
     [TestMethod]

@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using Fho.Core.Extensions.Exceptions;
@@ -34,7 +34,7 @@ public sealed class ConcurrentBitmap2
     /// </summary>
     private const ulong DATA_MASK = (1uL << SEGMENT_BIT_SIZE) - 1;
 
-    private readonly object _structuralMutex = new();
+    private readonly Lock _structuralLock = new();
 
     /// <summary>
     /// Number of threads currently inside a hot-path operation that may touch segment storage.
@@ -50,7 +50,7 @@ public sealed class ConcurrentBitmap2
     /// Global count of set bits. Maintained with an increment-before-publish / decrement-after-clear
     /// protocol so that a zero reading is never a false empty.
     /// </summary>
-    private int _setBitCount;
+    private int _popCount;
 
     private volatile Bitmap2Storage _storage;
 
@@ -73,7 +73,7 @@ public sealed class ConcurrentBitmap2
     /// been cleared, or a set may still be in flight. False negatives are acceptable; false
     /// positives are not.
     /// </remarks>
-    public bool IsEmpty => Volatile.Read(ref _setBitCount) == 0;
+    public bool IsEmpty => Volatile.Read(ref _popCount) == 0;
 
     /// <summary>
     /// Gets the number of usable bits in this instance.
@@ -87,7 +87,7 @@ public sealed class ConcurrentBitmap2
     /// May temporarily over-count while a set is published (increment happens before the bit CAS).
     /// Never under-counts in a way that would make <see cref="IsEmpty"/> return true incorrectly.
     /// </remarks>
-    public int VolatileSetCount => Volatile.Read(ref _setBitCount);
+    public int VolatileSetCount => Volatile.Read(ref _popCount);
 
     /// <summary>
     /// Returns a versioned snapshot of the bit at <paramref name="index"/>.
@@ -184,7 +184,7 @@ public sealed class ConcurrentBitmap2
     {
         ArgumentOutOfRangeException.ThrowIfNegative(newSize, nameof(newSize));
 
-        lock (_structuralMutex)
+        lock (_structuralLock)
         {
             if (newSize <= _storage.Size)
             {
@@ -201,15 +201,15 @@ public sealed class ConcurrentBitmap2
     /// </summary>
     public void RemoveBitAt(int index)
     {
-        lock (_structuralMutex)
+        lock (_structuralLock)
         {
             Bitmap2Storage current = _storage;
-            ArgumentOutOfRangeException.ThrowIfNotInRange(index, 0, current.Size - 1, nameof(index));
+            ArgumentOutOfRangeException.ThrowIfNotInRange(index, 0, current.Size - 1);
 
             using StructuralScope structural = EnterStructural();
 
             current = _storage;
-            ArgumentOutOfRangeException.ThrowIfNotInRange(index, 0, current.Size - 1, nameof(index));
+            ArgumentOutOfRangeException.ThrowIfNotInRange(index, 0, current.Size - 1);
 
             bool removedWasSet = ConcurrentBitmap56.VolatileRead(ref current.SegmentRef(index))
                 .IsBitSet(BitInSegment(index));
@@ -219,7 +219,7 @@ public sealed class ConcurrentBitmap2
             if (removedWasSet)
             {
                 // Removal is published; decrement after the bit is no longer observable.
-                Interlocked.Decrement(ref _setBitCount);
+                Interlocked.Decrement(ref _popCount);
             }
         }
     }
@@ -295,17 +295,13 @@ public sealed class ConcurrentBitmap2
 
     /// <summary>
     /// Attempts one compare-and-swap that applies <paramref name="isSet"/> and updates
-    /// <see cref="_setBitCount"/> with the emptiness-safe protocol.
+    /// <see cref="_popCount"/> with the emptiness-safe protocol.
     /// </summary>
     /// <param name="requiredToken">
     /// When non-null, the CAS requires the segment guard token to match; used by
     /// <see cref="TryUpdateBit"/>. When null, the write is unconditional aside from CAS conflicts.
     /// </param>
-    private bool TryCommitBitTransition(
-        ref ConcurrentBitmap56State state,
-        int bit,
-        bool isSet,
-        byte? requiredToken)
+    private bool TryCommitBitTransition(ref ConcurrentBitmap56State state, int bit, bool isSet, byte? requiredToken)
     {
         ref ulong target = ref AsUlong(ref state);
         ulong oldState = Volatile.Read(ref target);
@@ -332,10 +328,10 @@ public sealed class ConcurrentBitmap2
         if (isSet)
         {
             // 0 → 1: increment first, then CAS. Undo if the CAS loses.
-            Interlocked.Increment(ref _setBitCount);
+            Interlocked.Increment(ref _popCount);
             if (Interlocked.CompareExchange(ref target, newState, oldState) != oldState)
             {
-                Interlocked.Decrement(ref _setBitCount);
+                Interlocked.Decrement(ref _popCount);
                 return false;
             }
 
@@ -348,7 +344,7 @@ public sealed class ConcurrentBitmap2
             return false;
         }
 
-        Interlocked.Decrement(ref _setBitCount);
+        Interlocked.Decrement(ref _popCount);
         return true;
     }
 
@@ -404,7 +400,7 @@ public sealed class ConcurrentBitmap2
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void ValidateIndex(int index, int size) =>
-        ArgumentOutOfRangeException.ThrowIfNotInRange(index, 0, size - 1, nameof(index));
+        ArgumentOutOfRangeException.ThrowIfNotInRange(index, 0, size - 1);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int BitInSegment(int index) => index % SEGMENT_BIT_SIZE;
@@ -416,22 +412,14 @@ public sealed class ConcurrentBitmap2
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static byte GetTokenFromState(ulong state) => (byte)(state >> 56);
 
-    private readonly struct HotPathScope : IDisposable
+    private readonly struct HotPathScope(ConcurrentBitmap2 owner) : IDisposable
     {
-        private readonly ConcurrentBitmap2 _owner;
-
-        public HotPathScope(ConcurrentBitmap2 owner) => _owner = owner;
-
-        public void Dispose() => _owner.ExitHotPath();
+        public void Dispose() => owner.ExitHotPath();
     }
 
-    private readonly struct StructuralScope : IDisposable
+    private readonly struct StructuralScope(ConcurrentBitmap2 owner) : IDisposable
     {
-        private readonly ConcurrentBitmap2 _owner;
-
-        public StructuralScope(ConcurrentBitmap2 owner) => _owner = owner;
-
-        public void Dispose() => _owner.ExitStructural();
+        public void Dispose() => owner.ExitStructural();
     }
 }
 
@@ -497,8 +485,7 @@ internal sealed class Bitmap2Storage
             }
 
             int newIndex = oldIndex < index ? oldIndex : oldIndex - 1;
-            ulong sourceWord = Unsafe.As<ConcurrentBitmap56State, ulong>(
-                ref Segments[oldIndex / ConcurrentBitmap2.SEGMENT_BIT_SIZE]);
+            ulong sourceWord = Unsafe.As<ConcurrentBitmap56State, ulong>(ref Segments[oldIndex / ConcurrentBitmap2.SEGMENT_BIT_SIZE]);
             bool bit = (sourceWord & (1uL << (oldIndex % ConcurrentBitmap2.SEGMENT_BIT_SIZE))) != 0;
             if (bit)
             {
