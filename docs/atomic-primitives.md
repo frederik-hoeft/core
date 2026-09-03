@@ -33,7 +33,7 @@ Its canonical encodings are:
 
 The all-ones true representation is useful for branchless mask expansion in low-level code. Conversions to `bool` treat any non-zero internal value as true, while normal construction from `bool` produces one of the canonical encodings.
 
-`Atomic.Exchange`, `Atomic.CompareExchange`, and `Atomic.VolatileRead` provide the corresponding atomic operations over this type. `AsyncLock` uses them to make disposal a one-winner state transition.
+`Atomic.Exchange`, `Atomic.CompareExchange`, and `Atomic.VolatileRead` provide the corresponding atomic operations over this type.
 
 ## Generic enum operations
 

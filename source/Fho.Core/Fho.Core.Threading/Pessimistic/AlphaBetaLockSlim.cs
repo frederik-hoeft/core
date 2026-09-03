@@ -54,9 +54,9 @@ public sealed class AlphaBetaLockSlim : IDisposable
     // the beta to wait.
     private ulong _owners;
 
-    private const ulong WAITING_ALPHAS =    0x8000000000000000;
-    private const ulong ALPHA_COUNT_MASK =  0x7FFFFFFF00000000;
-    private const ulong BETA_COUNT_MASK =   0x000000007FFFFFFF;
+    private const ulong WAITING_ALPHAS = 0x8000000000000000;
+    private const ulong ALPHA_COUNT_MASK = 0x7FFFFFFF00000000;
+    private const ulong BETA_COUNT_MASK = 0x000000007FFFFFFF;
 
     // The max numbers in each group are actually one less then their theoretical max.
     // This is done in order to prevent count overflows. If the count reaches max,
@@ -96,7 +96,7 @@ public sealed class AlphaBetaLockSlim : IDisposable
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static bool IsABCEmpty(AlphaBetaCount abc) => 
+    private static bool IsABCEmpty(AlphaBetaCount abc) =>
         abc.LockId == 0 || abc.Ownership == AlphaBetaOwner.None;
 
     private bool IsABCHashEntryChanged(AlphaBetaCount abc) => abc.LockId != _lockId;
@@ -219,7 +219,7 @@ public sealed class AlphaBetaLockSlim : IDisposable
     private bool TryEnterBetaLockCore(TimeoutTracker timeout)
     {
         ObjectDisposedException.ThrowIf(_disposedValue, this);
-        
+
         AlphaBetaCount abc = GetThreadABCount(dontAllocate: false)!;
         // Can't acquire beta lock with alpha lock held.
         _ = abc.Ownership switch
@@ -618,7 +618,7 @@ public sealed class AlphaBetaLockSlim : IDisposable
         if (setBetaEvent)
         {
             // release all betas. Known non-null because _numBetaWaiters != 0.
-            _betaEvent!.Set();  
+            _betaEvent!.Set();
         }
     }
 

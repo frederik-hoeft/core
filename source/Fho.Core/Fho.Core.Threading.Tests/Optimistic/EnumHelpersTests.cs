@@ -46,7 +46,7 @@ public sealed class EnumHelpersTests
     }
 
     [TestMethod]
-    public void And_ImplicitIntEnum_Works() 
+    public void And_ImplicitIntEnum_Works()
     {
         Assert.AreEqual(ImplicitIntEnum.None, ImplicitIntEnum.A.And(ImplicitIntEnum.B));
         Assert.AreEqual(ImplicitIntEnum.A, ImplicitIntEnum.A.And(ImplicitIntEnum.C));

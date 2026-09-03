@@ -231,7 +231,7 @@ internal sealed class ConcurrentBitmapInternalNode : ConcurrentBitmapNode
             // --> mark the child as full
             nodeState = nodeState.SetChildFull(childIndex);
         }
-        else if (!childState.AreChildrenEmpty(childCapacity) && nodeState.IsChildEmpty(childIndex) 
+        else if (!childState.AreChildrenEmpty(childCapacity) && nodeState.IsChildEmpty(childIndex)
             || !childState.AreChildrenFull(childCapacity) && nodeState.IsChildFull(childIndex))
         {
             // we set the bit to 1, and the child is now not empty anymore which is not yet reflected in the cluster bitmap

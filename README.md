@@ -6,9 +6,9 @@ A .NET 10 library providing low-level threading and concurrency utilities: an as
 
 ### Async locking
 
-`AsyncLock` is a `SemaphoreSlim`-backed mutual-exclusion lock safe for use across `await` async boundaries. It supports async-flow reentrancy via `AsyncLocal` depth tracking so the same logical async flow can re-enter without deadlocking. Work is submitted via `RunAsync`/`RunTaskAsync`; `TryRunAsync`/`TryRunTaskAsync` variants return an `AsyncLockResult` instead of throwing when the lock is disposed concurrently.
+`AsyncLock` is a `SemaphoreSlim`-backed mutual-exclusion lock whose critical section may cross `await` boundaries. Callers submit work through `RunAsync`/`RunTaskAsync` rather than manually acquiring and releasing ownership. Reentrancy is supported for a strictly serialized logical async call stack: inherited ownership can re-enter without taking another semaphore slot, while observable concurrent branching is rejected with `AsyncLockUsageException`.
 
-Disposal is orderly: it atomically marks the lock disposed, cancels any pending waiters, drains the waiter count, and then disposes the semaphore. Disposal races are normalized into `LockDisposedException` rather than surfacing `ObjectDisposedException` from the underlying primitive.
+Disposal closes admission immediately and cancels pending waiters, but physical cleanup is lazy. The internal cancellation source and semaphore remain alive until the last admitted waiter or lock holder leaves its resource path, so `Dispose` never waits for asynchronous continuations to run. `TryRunAsync`/`TryRunTaskAsync` report disposal-before-execution through `AsyncLockResult`; exceptions thrown by caller code, including `LockDisposedException`, still propagate normally in otherwise valid usage.
 
 ### Pessimistic locking
 
