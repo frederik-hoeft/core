@@ -19,11 +19,11 @@ The threading assembly is organized around four distinct concurrency models rath
 
 The synchronization layer provides locks when a caller needs an explicit exclusion or compatibility boundary.
 
-- `AsyncLock` serializes delegate execution across asynchronous boundaries. Ownership belongs to an async flow and the public API exposes execution-under-lock rather than manual enter/exit operations.
+- `AsyncLock` serializes delegate execution across asynchronous boundaries. Ownership is represented by a serialized async-flow frame stack, and the public API exposes execution-under-lock rather than manual enter/exit operations.
 - `AlphaBetaLockSlim` partitions synchronous callers into two compatibility groups. Members of the same group may run concurrently, while alpha and beta are mutually exclusive. Alpha admission takes precedence over beta admission.
 - `ReaderWriterLockSlimExtensions` adds disposable ownership handles around the BCL reader/writer lock API so synchronous lock lifetime can be expressed with `using`.
 
-These types intentionally have different ownership models. `AsyncLock` ownership follows asynchronous execution context, whereas `AlphaBetaLockSlim` ownership is thread-affine and `ReaderWriterLockSlimExtensions` preserve the ownership rules of the wrapped BCL lock.
+These types intentionally have different ownership models. `AsyncLock` ownership follows asynchronous execution context but permits reentrancy only along one serialized logical call stack. `AlphaBetaLockSlim` ownership is thread-affine, while `ReaderWriterLockSlimExtensions` preserve the ownership rules of the wrapped BCL lock.
 
 See [Synchronization](synchronization.md).
 
@@ -38,7 +38,7 @@ The common update pattern is:
 3. attempt a compare-and-swap;
 4. retry if another writer changed the value first.
 
-This layer is also used internally by higher-level components. For example, `AsyncLock` uses `AtomicBoolean` to arbitrate one-time disposal, and the bitmap implementation uses CAS-updated 64-bit state words.
+This layer is also used internally by higher-level components. The bitmap implementation, for example, uses CAS-updated 64-bit state words for its guarded leaf representation.
 
 See [Atomic primitives](atomic-primitives.md).
 
@@ -57,7 +57,8 @@ See [Concurrent collections](concurrent-collections.md).
 A few smaller types round out the public surface or support the major subsystems without introducing another architectural layer:
 
 - `Wait.Until` is a public polling helper that performs an immediate check, then bounded spinning, then sleep-based polling when no signaling primitive is available.
-- `LockDisposedException` gives `AsyncLock` a public disposal failure contract independent of races with its underlying `SemaphoreSlim`.
+- `LockDisposedException` gives `AsyncLock` a public disposal-before-execution contract independent of its underlying `SemaphoreSlim`.
+- `AsyncLockUsageException` reports observable violations of the lock's serialized reentrancy contract.
 - Internal `TimeoutTracker` carries one remaining timeout budget through the synchronous alpha/beta acquisition loops and handles zero and infinite timeouts.
 - An internal array-view wrapper provides soft resizing over backing child arrays used by bitmap tree nodes.
 
@@ -73,15 +74,12 @@ Fho.Core
         |
         v
 Fho.Core.Threading
-  Atomic / AtomicBoolean
-        |                 \
-        v                  v
-    AsyncLock        ConcurrentBitmap56
-                           |
-ReaderWriterLockSlim ------+------> ConcurrentBitmap tree
- extensions                 |
-                            v
-                    resizable child-array view
+  Atomic / AtomicBoolean ------> ConcurrentBitmap56
+                                      |
+ReaderWriterLockSlim -----------------+------> ConcurrentBitmap tree
+ extensions                            |
+                                       v
+                               resizable child-array view
 
 TimeoutTracker ------> AlphaBetaLockSlim
 ```
@@ -106,7 +104,7 @@ Lock ownership is always explicit:
 - synchronous alpha/beta and reader/writer ownership can be represented by `ILockOwnership` and a `using` scope;
 - direct `AlphaBetaLockSlim.Enter*` calls require a matching `Exit*` on the same thread.
 
-Disposal is therefore also a caller coordination concern. The lock implementations define what happens to their own waiters and resources, but they do not discover or stop arbitrary work outside their ownership boundary.
+Disposal is therefore also a caller coordination concern. `AsyncLock` closes admission, wakes its pending waiters, and defers physical cleanup until resource users have left; the synchronous locks have their own stricter disposal preconditions. None of the lock types discover or stop arbitrary work outside their ownership boundary.
 
 ## Checked and unsafe APIs
 

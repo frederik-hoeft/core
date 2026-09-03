@@ -4,55 +4,56 @@ The synchronization subsystem contains three lock models with deliberately diffe
 
 ## `AsyncLock`: async-flow mutual exclusion
 
-`AsyncLock` serializes work submitted through its `RunAsync` and `RunTaskAsync` families. The public API does not expose an acquisition token or separate exit operation. Instead, the lock owns acquisition and release around a caller-provided delegate, which keeps the release path inside a `finally` block controlled by the lock.
+`AsyncLock` serializes work submitted through its `RunAsync` and `RunTaskAsync` families. The public API exposes execution-under-lock rather than a manual enter/exit pair: acquisition, caller execution, and release remain one lock-owned operation, with release guaranteed from a `finally` path.
 
-### Acquisition and execution flow
+### Ownership and reentrancy
 
-For the outermost call in an async flow:
+An outer acquisition owns one slot in a single-count `SemaphoreSlim`. Once acquired, the lock creates an ownership context for that physical lease and places a root ownership frame in the current `AsyncLocal`. Nested async calls inherit that frame through `ExecutionContext`, which allows reentrant calls to recognize the existing physical ownership across ordinary `await` boundaries.
 
-1. the lock checks whether it has already been disposed;
-2. it creates a linked cancellation source only when caller cancellation must be combined with disposal cancellation;
-3. it waits asynchronously on the single-slot `SemaphoreSlim`;
-4. after acquisition, it records ownership in an `AsyncLocal<int>` depth counter;
-5. it executes the caller delegate while holding the semaphore;
-6. the `finally` path decrements the depth and releases the semaphore when the outermost scope exits.
+Inheritance alone is not treated as proof that a branch may re-enter. Each ownership context contains one shared top-of-stack reference, while each async flow carries the frame it inherited. A reentrant call may advance the stack only when its inherited frame is still the shared top. The new frame is installed atomically, so two descendants that inherited the same parent frame cannot both become the next reentrant owner.
 
-Nested calls made in the same async flow see a non-zero depth and skip the semaphore wait. The depth still changes for each nested scope, so only the outermost scope owns the physical semaphore slot.
+This establishes a strict serialized call-stack contract:
 
-This makes reentrancy an async-execution-context property. It is not thread recursion: continuations may resume on different threads while remaining part of the same logical async flow.
+```text
+outer
+  -> nested
+       -> nested
+       <- nested
+  <- nested
+<- outer
+```
 
-### Synchronous versus asynchronous delegates
+Concurrent branching of inherited ownership is invalid. A sibling reentrant acquisition, a parent trying to re-enter while a child frame is active, stale inherited ownership after the root has exited, or a non-LIFO exit raises `AsyncLockUsageException`. The shared ownership context is then poisoned: existing frames may still unwind so the physical semaphore can be released safely, but no further reentrant acquisition is accepted through that context.
 
-`RunAsync` accepts synchronous `Action`/`Func<TResult>` delegates. `RunTaskAsync` accepts delegates that return `Task` or `Task<TResult>` and passes the original caller cancellation token into them.
+If an ancestor exits while a descendant frame is still active, the lock does not release the semaphore underneath the descendant. The ancestor is marked for deferred exit, the violating operation throws, and the descendant that eventually unwinds the stack also drains any exposed exit-requested ancestors. The root semaphore lease is released only when the root frame is actually removed.
 
-In both cases the critical section lasts until the supplied work completes. The lock does not release between awaits inside a `RunTaskAsync` delegate.
+The lock can diagnose only state transitions that cross its API boundary. Caller code that forks while holding the lock, overlaps protected work, and restores the ownership stack before the original branch next interacts with the lock can evade detection. Such concurrent branching is still outside the contract; once it occurs, mutual-exclusion guarantees do not apply to the overlapping caller code even if no exception is observed.
 
-### Cancellation
+`IsHeld` therefore means that the current async flow carries the active, non-poisoned top frame for this ownership context. It is not a thread-affinity check.
 
-Caller cancellation and disposal cancellation have different contracts.
+### Delegate execution
 
-Caller cancellation can interrupt a pending semaphore wait. If the caller delegate accepts the token, the same original token is also passed into that delegate; cancellation during execution is therefore cooperative and determined by the delegate.
+`RunAsync` accepts synchronous `Action`/`Func<TResult>` delegates. `RunTaskAsync` accepts delegates that return `Task` or `Task<TResult>`. In both cases the critical section lasts until the supplied work completes; the lock is not released between awaits inside an asynchronous delegate.
 
-Disposal cancellation exists to terminate pending acquisition. If a semaphore wait is canceled because the lock is being disposed, the implementation converts that race into `LockDisposedException`. Caller-originated cancellation remains `OperationCanceledException`.
+The original caller cancellation token is passed to asynchronous delegates. The lock does not introduce disposal cancellation into caller code, so an already admitted delegate is not forcibly aborted when the lock is disposed.
 
-### Disposal
+### Cancellation and result semantics
 
-Disposal is a terminal state transition arbitrated by `AtomicBoolean`. The first disposer:
+For an outer acquisition, caller cancellation can interrupt the pending semaphore wait. When caller cancellation wins, the operation throws `OperationCanceledException` associated with the original caller token. Disposal uses a separate internal cancellation source only to wake waiters that have not been admitted to caller execution.
 
-1. marks the lock disposed so new entries fail;
-2. cancels the internal token source, waking pending waiters;
-3. waits until registered semaphore waiters have observed cancellation and left the wait path;
-4. disposes the semaphore.
+Acquisition status is resolved before the caller delegate is invoked. The `Run*` methods therefore report disposal-before-execution as `LockDisposedException`, while the corresponding `Try*` methods return an `AsyncLockResult` with `TaskExecuted == false`. In otherwise valid ownership usage, once caller code has started its exceptions propagate unchanged. In particular, a `LockDisposedException` thrown by the caller delegate is not reinterpreted as a skipped `Try*` operation. A simultaneous reentrancy-contract violation can instead surface `AsyncLockUsageException` from the lock-owned unwind path.
 
-A delegate that already owns the lock is not forcibly aborted. Its release path tolerates the semaphore having been disposed concurrently.
+The generic `AsyncLockResult<TResult>` carries the delegate result and exposes `TryGetResult`; it can be converted to the non-generic form when only execution status matters. The result is specifically an admission/disposal contract, not a general success/failure envelope.
 
-The `TryRunAsync` and `TryRunTaskAsync` families convert `LockDisposedException` into an `AsyncLockResult` whose `TaskExecuted` flag is false. They do not suppress caller cancellation or exceptions thrown by the user delegate.
+### Disposal and resource lifetime
 
-### Result contract
+Disposal separates logical lifetime from physical resource lifetime. The first `Dispose` closes admission and cancels the internal disposal token so pending waiters can leave. It does not wait for those continuations, post a draining task, or require a synchronization context, task scheduler, or spare thread-pool worker to make progress.
 
-`AsyncLockResult` distinguishes "the task ran" from "the task was skipped because the lock was disposed." The generic form carries the delegate result and exposes `TryGetResult`; it can also be converted to the non-generic result when only execution status matters.
+An outer acquisition registers as a resource user before it reads the internal cancellation token or touches the semaphore. That reference remains active until the wait path has fully exited or, after successful acquisition, until the root ownership frame finally releases the physical semaphore lease. Reentrant frames share the root reference because they do not touch another physical semaphore slot.
 
-This result is specifically a disposal-race contract. It is not a general success/failure envelope for the protected work.
+Physical disposal of the cancellation source and semaphore is enabled only after disposal cancellation has been issued. If no resource user remains, the disposing thread finalizes inline. Otherwise `Dispose` returns immediately, and one participant atomically claims cleanup after the last admitted waiter or root holder has left. Racing calls rejected after admission closes may participate transiently in the lifetime count, but they never touch the disposable resources. No participant blocks waiting for another participant to reach cleanup.
+
+Operations that crossed the acquisition admission point before disposal may finish normally. Waiters that have not been admitted, future outer acquisitions, and reentrant acquisitions attempted after logical disposal do not start new caller work.
 
 ## `AlphaBetaLockSlim`: two compatibility groups
 
