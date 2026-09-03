@@ -1,14 +1,13 @@
 ﻿using Fho.Core.Threading.Exceptions;
-using Fho.Core.Threading.Optimistic;
 using System.Diagnostics;
 
 namespace Fho.Core.Threading.Async;
 
 /// <summary>
-/// A simple lock that can be used across asynchronous boundaries.
+/// An asynchronous mutual-exclusion lock that can be held across await boundaries.
 /// </summary>
 /// <remarks>
-/// This lock is reentrant for the same async-flow, as long as Exit is called the same number of times as Enter.
+/// Reentrancy is supported for a serialized async call stack. Concurrent branching of inherited ownership is invalid usage.
 /// </remarks>
 [DebuggerDisplay("IsHeld = {IsHeld}")]
 // nobody wants to step through the internals of a lock when debugging business logic,
@@ -17,33 +16,31 @@ namespace Fho.Core.Threading.Async;
 [method: DebuggerStepThrough]
 public sealed class AsyncLock() : IDisposable
 {
+    private const string REENTRANCY_BRANCH_MESSAGE = "Concurrent or branched reentrant AsyncLock acquisition violated the serialized call-stack contract.";
+
     // Task.CompletedTask, just with a dummy bool result to wrap Action delegates into Task<TResult>
     private static readonly Task<bool> s_completedDummyTask = Task.FromResult(true);
 
-    // the semaphore is used as a gatekeeper to ensure that only one async flow can enter the lock at a time
-    // it implements the waiting mechanism for the lock
+    // the semaphore owns the physical exclusion slot; reentrant frames share one acquired slot
     private readonly SemaphoreSlim _semaphore = new(initialCount: 1, maxCount: 1);
-    // the CTS is used to cancel all waiting async flows when the lock is disposed
-    private readonly CancellationTokenSource _cts = new();
-    // the async local is used to keep track of the number of locks held by the current async flow
-    // this allows the lock to be reentrant for the same async flow
-    private readonly AsyncLocal<int> _al_locksHeld = new();
-    // an "interlocked" boolean to keep track of the disposed state
-    private AtomicBoolean _disposedValue;
-    // an interlocked counter to keep track of the number of waiting async flows
-    // this is important to ensure that we can dispose the semaphore safely,
-    // releasing its resources only after all waiting async flows have been fully cancelled
-    private int _waitingCount;
+    // disposal cancellation is used only to wake pending outer waiters
+    private readonly CancellationTokenSource _disposalCancellationSource = new();
+    // each async flow carries its current frame; all descendant frames share a heap ownership context
+    private readonly AsyncLocal<OwnershipFrame?> _al_currentFrame = new();
+    // outer acquisition paths and root owners keep the disposable resources alive while they may be touched
+    private int _resourceUsers;
+    // see LifecycleState: disposal closes admission before cancellation and enables finalization only afterwards
+    private int _lifecycleState;
 
     /// <summary>
-    /// Whether the current async flow has exclusive ownership of the lock.
+    /// Whether the current async flow is the active serialized owner of the lock.
     /// </summary>
-    public bool IsHeld => _al_locksHeld.Value > 0;
+    public bool IsHeld => GetCurrentActiveFrame() is not null;
 
     /// <summary>
     /// The number of times the current async flow has entered the lock recursively.
     /// </summary>
-    internal int LocksHeld => _al_locksHeld.Value;
+    internal int LocksHeld => GetCurrentActiveFrame()?.Depth ?? 0;
 
     /// <summary>
     /// Asynchronously acquires the lock and executes the specified synchronous action, releasing the lock when the action completes.
@@ -52,11 +49,13 @@ public sealed class AsyncLock() : IDisposable
     /// <param name="synchronizedAction">The action to execute while holding the lock.</param>
     /// <param name="cancellationToken">The token to monitor for cancellation requests.</param>
     /// <returns>A task that represents the asynchronous operation.</returns>
-    /// <exception cref="LockDisposedException">Thrown if the lock has been disposed.</exception>
+    /// <exception cref="LockDisposedException">Thrown if the lock has been disposed before the action can begin.</exception>
+    /// <exception cref="AsyncLockUsageException">Thrown when inherited reentrant ownership violates the serialized call-stack contract.</exception>
     [DebuggerStepThrough]
     public Task<TResult> RunAsync<TResult>(Func<TResult> synchronizedAction, CancellationToken cancellationToken = default)
     {
-        return LockAsync(Wrapper, cancellationToken);
+        ArgumentNullException.ThrowIfNull(synchronizedAction);
+        return RunCoreAsync(Wrapper, cancellationToken);
 
         [DebuggerStepThrough]
         Task<TResult> Wrapper(CancellationToken _) => Task.FromResult(synchronizedAction());
@@ -68,11 +67,13 @@ public sealed class AsyncLock() : IDisposable
     /// <param name="synchronizedAction">The action to execute while holding the lock.</param>
     /// <param name="cancellationToken">The token to monitor for cancellation requests.</param>
     /// <returns>A task that represents the asynchronous operation.</returns>
-    /// <exception cref="LockDisposedException">Thrown if the lock has been disposed.</exception>
+    /// <exception cref="LockDisposedException">Thrown if the lock has been disposed before the action can begin.</exception>
+    /// <exception cref="AsyncLockUsageException">Thrown when inherited reentrant ownership violates the serialized call-stack contract.</exception>
     [DebuggerStepThrough]
     public Task RunAsync(Action synchronizedAction, CancellationToken cancellationToken = default)
     {
-        return LockAsync(Wrapper, cancellationToken);
+        ArgumentNullException.ThrowIfNull(synchronizedAction);
+        return RunCoreAsync(Wrapper, cancellationToken);
 
         [DebuggerStepThrough]
         Task<bool> Wrapper(CancellationToken _)
@@ -84,24 +85,20 @@ public sealed class AsyncLock() : IDisposable
 
     /// <summary>
     /// Attempts to asynchronously acquire the lock and execute the specified synchronous action, releasing the lock when the action completes.
-    /// This method supports concurrent disposal of the lock and will return a result indicating whether the action was executed or skipped due to disposal.
     /// </summary>
     /// <typeparam name="TResult">The type of the result returned by the action.</typeparam>
     /// <param name="synchronizedAction">The action to execute while holding the lock.</param>
     /// <param name="cancellationToken">The token to monitor for cancellation requests.</param>
-    /// <returns>A task that represents the asynchronous operation. The result either contains the result of the action or indicates that the action was skipped due to lock disposal.</returns>
+    /// <returns>A task whose result indicates whether the action was executed before disposal.</returns>
+    /// <exception cref="AsyncLockUsageException">Thrown when inherited reentrant ownership violates the serialized call-stack contract.</exception>
     [DebuggerStepThrough]
-    public async Task<AsyncLockResult<TResult>> TryRunAsync<TResult>(Func<TResult> synchronizedAction, CancellationToken cancellationToken = default)
+    public Task<AsyncLockResult<TResult>> TryRunAsync<TResult>(Func<TResult> synchronizedAction, CancellationToken cancellationToken = default)
     {
-        try
-        {
-            TResult result = await RunAsync(synchronizedAction, cancellationToken);
-            return new AsyncLockResult<TResult>(result, TaskExecuted: true);
-        }
-        catch (LockDisposedException)
-        {
-            return AsyncLockResult.Skipped<TResult>();
-        }
+        ArgumentNullException.ThrowIfNull(synchronizedAction);
+        return TryRunCoreAsync(Wrapper, cancellationToken);
+
+        [DebuggerStepThrough]
+        Task<TResult> Wrapper(CancellationToken _) => Task.FromResult(synchronizedAction());
     }
 
     /// <summary>
@@ -109,18 +106,19 @@ public sealed class AsyncLock() : IDisposable
     /// </summary>
     /// <param name="synchronizedAction">The action to execute while holding the lock.</param>
     /// <param name="cancellationToken">The token to monitor for cancellation requests.</param>
-    /// <returns>A task that represents the asynchronous operation. The result indicates whether the action was executed or skipped due to lock disposal.</returns>
+    /// <returns>A task whose result indicates whether the action was executed before disposal.</returns>
+    /// <exception cref="AsyncLockUsageException">Thrown when inherited reentrant ownership violates the serialized call-stack contract.</exception>
     [DebuggerStepThrough]
-    public async Task<AsyncLockResult> TryRunAsync(Action synchronizedAction, CancellationToken cancellationToken = default)
+    public Task<AsyncLockResult> TryRunAsync(Action synchronizedAction, CancellationToken cancellationToken = default)
     {
-        try
+        ArgumentNullException.ThrowIfNull(synchronizedAction);
+        return TryRunCoreWithoutResultAsync(Wrapper, cancellationToken);
+
+        [DebuggerStepThrough]
+        Task<bool> Wrapper(CancellationToken _)
         {
-            await RunAsync(synchronizedAction, cancellationToken);
-            return new AsyncLockResult(TaskExecuted: true);
-        }
-        catch (LockDisposedException)
-        {
-            return AsyncLockResult.Skipped();
+            synchronizedAction();
+            return s_completedDummyTask;
         }
     }
 
@@ -130,11 +128,13 @@ public sealed class AsyncLock() : IDisposable
     /// <param name="synchronizedTask">The asynchronous task to execute while holding the lock.</param>
     /// <param name="cancellationToken">The token to monitor for cancellation requests.</param>
     /// <returns>A task that represents the asynchronous operation.</returns>
-    /// <exception cref="LockDisposedException">Thrown if the lock has been disposed.</exception>
+    /// <exception cref="LockDisposedException">Thrown if the lock has been disposed before the task can begin.</exception>
+    /// <exception cref="AsyncLockUsageException">Thrown when inherited reentrant ownership violates the serialized call-stack contract.</exception>
     [DebuggerStepThrough]
     public Task RunTaskAsync(Func<CancellationToken, Task> synchronizedTask, CancellationToken cancellationToken = default)
     {
-        return LockAsync(Wrapper, cancellationToken);
+        ArgumentNullException.ThrowIfNull(synchronizedTask);
+        return RunCoreAsync(Wrapper, cancellationToken);
 
         [DebuggerStepThrough]
         async Task<bool> Wrapper(CancellationToken ct)
@@ -151,32 +151,33 @@ public sealed class AsyncLock() : IDisposable
     /// <param name="synchronizedTask">The asynchronous task to execute while holding the lock.</param>
     /// <param name="cancellationToken">The token to monitor for cancellation requests.</param>
     /// <returns>A task that represents the asynchronous operation.</returns>
-    /// <exception cref="LockDisposedException">Thrown if the lock has been disposed.</exception>
+    /// <exception cref="LockDisposedException">Thrown if the lock has been disposed before the task can begin.</exception>
+    /// <exception cref="AsyncLockUsageException">Thrown when inherited reentrant ownership violates the serialized call-stack contract.</exception>
     [DebuggerStepThrough]
     public Task<TResult> RunTaskAsync<TResult>(Func<CancellationToken, Task<TResult>> synchronizedTask, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(synchronizedTask);
-        return LockAsync(synchronizedTask, cancellationToken);
+        return RunCoreAsync(synchronizedTask, cancellationToken);
     }
 
     /// <summary>
     /// Attempts to asynchronously acquire the lock and execute the specified asynchronous task, releasing the lock when the task completes.
-    /// This method supports concurrent disposal of the lock and will return a result indicating whether the task was executed or skipped due to disposal.
     /// </summary>
     /// <param name="synchronizedTask">The asynchronous task to execute while holding the lock.</param>
     /// <param name="cancellationToken">The token to monitor for cancellation requests.</param>
-    /// <returns>A task that represents the asynchronous operation. The result indicates whether the task was executed or skipped due to lock disposal.</returns>
+    /// <returns>A task whose result indicates whether the task was executed before disposal.</returns>
+    /// <exception cref="AsyncLockUsageException">Thrown when inherited reentrant ownership violates the serialized call-stack contract.</exception>
     [DebuggerStepThrough]
-    public async Task<AsyncLockResult> TryRunTaskAsync(Func<CancellationToken, Task> synchronizedTask, CancellationToken cancellationToken = default)
+    public Task<AsyncLockResult> TryRunTaskAsync(Func<CancellationToken, Task> synchronizedTask, CancellationToken cancellationToken = default)
     {
-        try
+        ArgumentNullException.ThrowIfNull(synchronizedTask);
+        return TryRunCoreWithoutResultAsync(Wrapper, cancellationToken);
+
+        [DebuggerStepThrough]
+        async Task<bool> Wrapper(CancellationToken ct)
         {
-            await RunTaskAsync(synchronizedTask, cancellationToken);
-            return new AsyncLockResult(TaskExecuted: true);
-        }
-        catch (LockDisposedException)
-        {
-            return AsyncLockResult.Skipped();
+            await synchronizedTask(ct);
+            return true;
         }
     }
 
@@ -186,171 +187,397 @@ public sealed class AsyncLock() : IDisposable
     /// <typeparam name="TResult">The type of the result returned by the task.</typeparam>
     /// <param name="synchronizedTask">The asynchronous task to execute while holding the lock.</param>
     /// <param name="cancellationToken">The token to monitor for cancellation requests.</param>
-    /// <returns>A task that represents the asynchronous operation. The result either contains the result of the task or indicates that the task was skipped due to lock disposal.</returns>
+    /// <returns>A task whose result indicates whether the task was executed before disposal.</returns>
+    /// <exception cref="AsyncLockUsageException">Thrown when inherited reentrant ownership violates the serialized call-stack contract.</exception>
     [DebuggerStepThrough]
-    public async Task<AsyncLockResult<TResult>> TryRunTaskAsync<TResult>(Func<CancellationToken, Task<TResult>> synchronizedTask, CancellationToken cancellationToken = default)
+    public Task<AsyncLockResult<TResult>> TryRunTaskAsync<TResult>(Func<CancellationToken, Task<TResult>> synchronizedTask, CancellationToken cancellationToken = default)
     {
-        try
-        {
-            TResult result = await RunTaskAsync(synchronizedTask, cancellationToken);
-            return new AsyncLockResult<TResult>(result, TaskExecuted: true);
-        }
-        catch (LockDisposedException)
-        {
-            return AsyncLockResult.Skipped<TResult>();
-        }
+        ArgumentNullException.ThrowIfNull(synchronizedTask);
+        return TryRunCoreAsync(synchronizedTask, cancellationToken);
     }
 
-    // core locking mechanism, MUST ensure that the lock is released in a finally block, otherwise we will deadlock
-    // allow the debugger to step into this method to quickly get to the user code
-    // since DebuggerStepThrough doesn't respect async boundaries we can't use it here
-    private async Task<TResult> LockAsync<TResult>(Func<CancellationToken, Task<TResult>> synchronizedTask, CancellationToken cancellationToken)
+    private async Task<TResult> RunCoreAsync<TResult>(Func<CancellationToken, Task<TResult>> synchronizedTask, CancellationToken cancellationToken)
     {
-        // validate arguments and enter the lock, allowing the debugger to skip over the internals
-        await EnterLockAsync(synchronizedTask, cancellationToken);
-        // at this point, we are holding the lock
-        // increment the number of locks held by this async flow to allow reentrancy
-        ++_al_locksHeld.Value;
+        ExecutionResult<TResult> execution = await ExecuteAsync(synchronizedTask, cancellationToken);
+        if (!execution.TaskExecuted)
+        {
+            throw new LockDisposedException(GetType().FullName);
+        }
+
+        return execution.Result!;
+    }
+
+    private async Task<AsyncLockResult> TryRunCoreWithoutResultAsync(Func<CancellationToken, Task<bool>> synchronizedTask, CancellationToken cancellationToken)
+    {
+        ExecutionResult<bool> execution = await ExecuteAsync(synchronizedTask, cancellationToken);
+        return execution.TaskExecuted ? new AsyncLockResult(TaskExecuted: true) : AsyncLockResult.Skipped();
+    }
+
+    private async Task<AsyncLockResult<TResult>> TryRunCoreAsync<TResult>(Func<CancellationToken, Task<TResult>> synchronizedTask, CancellationToken cancellationToken)
+    {
+        ExecutionResult<TResult> execution = await ExecuteAsync(synchronizedTask, cancellationToken);
+        return execution.TaskExecuted
+            ? new AsyncLockResult<TResult>(execution.Result, TaskExecuted: true)
+            : AsyncLockResult.Skipped<TResult>();
+    }
+
+    // Acquisition status is resolved before caller code runs so Try* never mistakes a caller-thrown
+    // LockDisposedException for a concurrent-disposal result.
+    private async Task<ExecutionResult<TResult>> ExecuteAsync<TResult>(Func<CancellationToken, Task<TResult>> synchronizedTask, CancellationToken cancellationToken)
+    {
+        OwnershipFrame? frame = await TryEnterAsync(cancellationToken);
+        if (frame is null)
+        {
+            return ExecutionResult<TResult>.Skipped();
+        }
+
+        _al_currentFrame.Value = frame;
         try
         {
-            // pass the original cancellation token to the synchronized task
-            // the TCS is only used to be able to break out of the semaphore wait
-            return await synchronizedTask(cancellationToken);
+            TResult result = await synchronizedTask(cancellationToken);
+            return ExecutionResult<TResult>.Executed(result);
         }
         finally
         {
-            ExitLock();
-        }
-    }
-
-    // enter the lock and do all the things we want to hide from the debugger
-    [DebuggerStepThrough]
-    private async Task EnterLockAsync<TResult>(Func<CancellationToken, Task<TResult>> synchronizedTask, CancellationToken cancellationToken)
-    {
-        ArgumentNullException.ThrowIfNull(synchronizedTask);
-        CheckDisposed();
-        // only enter the lock if we are not already holding it (reentrancy)
-        // remember that we cannot modify the async local here, since changes to it
-        // are not propagated up "against the flow" of async continuations
-        // the value will be incremented by the caller after this method returns
-        if (_al_locksHeld.Value == 0)
-        {
-            // this is the first time we are entering the lock
-            CancellationTokenSource? linkedCts = null;
-            CancellationToken ct;
-            if (cancellationToken.CanBeCanceled)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                // we will need to allocate a linked token source to ensure that we can cancel the wait from external sources as well as on disposal
-                linkedCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, cancellationToken);
-                ct = linkedCts.Token;
-            }
-            else
-            {
-                // we can use the internal CTS directly, since we don't need to worry about external cancellation
-                ct = _cts.Token;
-            }
             try
             {
-                // keep track of waiting async flows
-                Interlocked.Increment(ref _waitingCount);
-                // acquire the semaphore
-                await _semaphore.WaitAsync(ct);
-            }
-            catch (ObjectDisposedException inner)
-            {
-                // we failed to acquire the semaphore because it was disposed
-                // this can happen if we were just about to acquire the semaphore when the lock was disposed
-                // after we checked for disposal (TOC/TOU)
-                // since this is an exogenous exception, we need to convert it to a LockDisposedException
-                // to be able to detect and handle it properly if we are running in one of the TryRun*Async methods
-                LockDisposedException.Rethrow(inner);
-            }
-            catch (OperationCanceledException)
-            {
-                // convert the cancellation to a LockDisposedException if cancellation was due to disposal
-                CheckDisposed();
-                // otherwise, re-throw the cancellation
-                throw;
+                ExitFrame(frame);
             }
             finally
             {
-                Interlocked.Decrement(ref _waitingCount);
-                // sadly, we can't really TryReset and pool the CTS, like we usually do
-                // since the CTS is specifically linked to whatever CancellationToken was passed in
-                linkedCts?.Dispose();
+                // AsyncLocal assignments made by nested async methods do not flow back into their caller.
+                // Restoring the parent keeps this execution path internally coherent while it unwinds.
+                _al_currentFrame.Value = frame.Parent;
             }
         }
     }
 
-    // run cleanup internals hidden from the user code
     [DebuggerStepThrough]
-    private void ExitLock()
+    private Task<OwnershipFrame?> TryEnterAsync(CancellationToken cancellationToken)
     {
-        // decrement the number of locks held by this async flow
-        // this honestly is pretty much a no-op, since changes to the async local
-        // are not propagated up "against the flow" of async continuations.
-        // we are decrementing it anyway, to maintain sanity
-        --_al_locksHeld.Value;
-        Debug.Assert(_al_locksHeld.Value >= 0);
-        // if we are the outermost lock, we can release the semaphore
-        if (_al_locksHeld.Value == 0)
+        OwnershipFrame? inheritedFrame = _al_currentFrame.Value;
+        return inheritedFrame is null
+            ? TryEnterOuterAsync(cancellationToken)
+            : Task.FromResult(TryEnterReentrant(inheritedFrame));
+    }
+
+    [DebuggerStepThrough]
+    private OwnershipFrame? TryEnterReentrant(OwnershipFrame inheritedFrame)
+    {
+        if (ReadLifecycleState() != LifecycleState.Active)
         {
-            // but first, we need to re-sample for disposal
-            bool disposedValue = Atomic.VolatileRead(in _disposedValue);
-            if (!disposedValue)
+            return null;
+        }
+
+        OwnershipContext context = inheritedFrame.Context;
+        if (Volatile.Read(ref context.Poisoned) != 0)
+        {
+            throw new AsyncLockUsageException("The inherited AsyncLock ownership context was invalidated by an earlier reentrancy violation.");
+        }
+
+        OwnershipFrame? top = Volatile.Read(ref context.Top);
+        if (top is null)
+        {
+            Poison(context);
+            throw new AsyncLockUsageException("The async flow attempted to reuse stale AsyncLock ownership after its outer ownership had already ended.");
+        }
+
+        if (!ReferenceEquals(top, inheritedFrame) || Volatile.Read(ref inheritedFrame.ExitRequested) != 0)
+        {
+            Poison(context);
+            throw new AsyncLockUsageException(REENTRANCY_BRANCH_MESSAGE);
+        }
+
+        OwnershipFrame childFrame = new(context, inheritedFrame, inheritedFrame.Depth + 1);
+        OwnershipFrame? observed = Interlocked.CompareExchange(ref context.Top, childFrame, inheritedFrame);
+        if (!ReferenceEquals(observed, inheritedFrame))
+        {
+            Poison(context);
+            throw new AsyncLockUsageException(REENTRANCY_BRANCH_MESSAGE);
+        }
+
+        return childFrame;
+    }
+
+    [DebuggerStepThrough]
+    private async Task<OwnershipFrame?> TryEnterOuterAsync(CancellationToken cancellationToken)
+    {
+        Interlocked.Increment(ref _resourceUsers);
+        bool resourceReferenceTransferred = false;
+        bool semaphoreAcquired = false;
+        CancellationTokenSource? linkedCancellationSource = null;
+        try
+        {
+            // Registration happens before this check. Once Active has been observed, physical disposal
+            // cannot occur until this operation releases or transfers its resource reference.
+            if (ReadLifecycleState() != LifecycleState.Active)
             {
-                // catch exogenous cancellation due to concurrent disposal
-                try
-                {
-                    _semaphore.Release();
-                }
-                catch (ObjectDisposedException)
-                {
-                    // we are disposed, but since we are releasing the lock anyways
-                    // it's okay to ignore this issue. We could also re-throw the exception
-                    // but since the inner task already completed without error, it would be a bit silly to do so.
-                    // so just swallow the exception and move on with life
-                }
+                return null;
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+
+            CancellationToken waitToken;
+            if (cancellationToken.CanBeCanceled)
+            {
+                linkedCancellationSource = CancellationTokenSource.CreateLinkedTokenSource(_disposalCancellationSource.Token, cancellationToken);
+                waitToken = linkedCancellationSource.Token;
+            }
+            else
+            {
+                waitToken = _disposalCancellationSource.Token;
+            }
+
+            try
+            {
+                await _semaphore.WaitAsync(waitToken);
+                semaphoreAcquired = true;
+            }
+            catch (OperationCanceledException) when (ReadLifecycleState() != LifecycleState.Active)
+            {
+                return null;
+            }
+            catch (OperationCanceledException)
+            {
+                // WaitAsync reports cancellation with the linked token. Re-throw from the original caller
+                // token so callers can reliably identify caller cancellation.
+                cancellationToken.ThrowIfCancellationRequested();
+                throw;
+            }
+
+            // A successful semaphore wait can race disposal cancellation or another holder's release.
+            // Observing Active here is the admission linearization point for caller execution.
+            if (ReadLifecycleState() != LifecycleState.Active)
+            {
+                return null;
+            }
+
+            // Dispose the temporary linked source while this acquisition still owns the resource reference.
+            // If disposal were ever to fail, the local finally path can still release both the semaphore slot
+            // and the resource reference instead of leaking a transferred root lease.
+            linkedCancellationSource?.Dispose();
+            linkedCancellationSource = null;
+
+            OwnershipContext context = new();
+            OwnershipFrame rootFrame = new(context, parent: null, depth: 1);
+            Volatile.Write(ref context.Top, rootFrame);
+
+            // The root ownership context now owns both the semaphore slot and this resource reference.
+            resourceReferenceTransferred = true;
+            semaphoreAcquired = false;
+            return rootFrame;
+        }
+        finally
+        {
+            if (semaphoreAcquired)
+            {
+                _semaphore.Release();
+            }
+
+            linkedCancellationSource?.Dispose();
+
+            if (!resourceReferenceTransferred)
+            {
+                ReleaseResourceUser();
             }
         }
     }
 
     [DebuggerStepThrough]
-    private void CheckDisposed()
+    private void ExitFrame(OwnershipFrame frame)
     {
-        bool disposedValue = Atomic.VolatileRead(in _disposedValue);
-        LockDisposedException.ThrowIf(disposedValue, this);
+        OwnershipContext context = frame.Context;
+        while (true)
+        {
+            OwnershipFrame? top = Volatile.Read(ref context.Top);
+            if (ReferenceEquals(top, frame))
+            {
+                OwnershipFrame? observed = Interlocked.CompareExchange(ref context.Top, frame.Parent, frame);
+                if (!ReferenceEquals(observed, frame))
+                {
+                    continue;
+                }
+
+                if (frame.Parent is null)
+                {
+                    ReleaseRootOwnership(context);
+                    return;
+                }
+
+                DrainExitRequestedFrames(context);
+                return;
+            }
+
+            // A descendant is still active, or this frame has already become stale. Record the exit
+            // request before failing so the descendant that eventually reaches this frame can finish
+            // physical cleanup instead of releasing the semaphore underneath itself.
+            Interlocked.Exchange(ref frame.ExitRequested, 1);
+            Poison(context);
+            DrainExitRequestedFrames(context);
+            throw new AsyncLockUsageException("AsyncLock ownership exited out of order while a descendant reentrant frame was still active.");
+        }
+    }
+
+    [DebuggerStepThrough]
+    private void DrainExitRequestedFrames(OwnershipContext context)
+    {
+        while (true)
+        {
+            OwnershipFrame? top = Volatile.Read(ref context.Top);
+            if (top is null || Volatile.Read(ref top.ExitRequested) == 0)
+            {
+                return;
+            }
+
+            OwnershipFrame? observed = Interlocked.CompareExchange(ref context.Top, top.Parent, top);
+            if (!ReferenceEquals(observed, top))
+            {
+                continue;
+            }
+
+            if (top.Parent is null)
+            {
+                ReleaseRootOwnership(context);
+                return;
+            }
+        }
+    }
+
+    [DebuggerStepThrough]
+    private void ReleaseRootOwnership(OwnershipContext context)
+    {
+        Debug.Assert(Volatile.Read(ref context.Top) is null);
+        int previousRootReleased = Interlocked.Exchange(ref context.RootReleased, 1);
+        Debug.Assert(previousRootReleased == 0);
+
+        try
+        {
+            _semaphore.Release();
+        }
+        finally
+        {
+            ReleaseResourceUser();
+        }
+    }
+
+    [DebuggerStepThrough]
+    private OwnershipFrame? GetCurrentActiveFrame()
+    {
+        OwnershipFrame? frame = _al_currentFrame.Value;
+        if (frame is null || Volatile.Read(ref frame.Context.Poisoned) != 0)
+        {
+            return null;
+        }
+
+        return ReferenceEquals(Volatile.Read(ref frame.Context.Top), frame) ? frame : null;
+    }
+
+    [DebuggerStepThrough]
+    private static void Poison(OwnershipContext context) => Interlocked.Exchange(ref context.Poisoned, 1);
+
+    [DebuggerStepThrough]
+    private LifecycleState ReadLifecycleState() => (LifecycleState)Volatile.Read(ref _lifecycleState);
+
+    [DebuggerStepThrough]
+    private void ReleaseResourceUser()
+    {
+        int remaining = Interlocked.Decrement(ref _resourceUsers);
+        Debug.Assert(remaining >= 0);
+        if (remaining == 0)
+        {
+            TryFinalizeDisposal();
+        }
+    }
+
+    [DebuggerStepThrough]
+    private void TryFinalizeDisposal()
+    {
+        if (Volatile.Read(ref _resourceUsers) != 0)
+        {
+            return;
+        }
+
+        if (Interlocked.CompareExchange(
+            ref _lifecycleState,
+            (int)LifecycleState.Disposed,
+            (int)LifecycleState.Quiescing) != (int)LifecycleState.Quiescing)
+        {
+            return;
+        }
+
+        try
+        {
+            _disposalCancellationSource.Dispose();
+        }
+        finally
+        {
+            _semaphore.Dispose();
+        }
     }
 
     /// <summary>
-    /// Releases all resources used by the current instance of the <see cref="AsyncLock"/> class.
+    /// Logically disposes the lock, cancels pending waiters, and releases its resources once admitted users have quiesced.
     /// </summary>
     /// <remarks>
-    /// This method is thread-safe, but will cause all pending and future interactions with the lock to throw an <see cref="LockDisposedException"/>.
+    /// This method is thread-safe and non-blocking with respect to pending asynchronous lock operations. An already admitted or executing delegate is allowed to finish; waiters that have not crossed the execution-admission point and future acquisitions do not start caller code.
     /// </remarks>
     public void Dispose()
     {
-        // ensure that we only dispose once
-        // also, causes all future interactions to throw an LockDisposedException
-        if (Atomic.CompareExchange(ref _disposedValue, value: true, comparand: false) == AtomicBoolean.FALSE)
+        if (Interlocked.CompareExchange(
+            ref _lifecycleState,
+            (int)LifecycleState.Canceling,
+            (int)LifecycleState.Active) != (int)LifecycleState.Active)
         {
-            // we are the first to dispose, so we need to cancel all waiting async flows
-            // this will cause them to throw an OperationCanceledException when they try to acquire the lock
-            _cts.Cancel();
-            _cts.Dispose();
-            // we are marked for disposal, so any waiting threads are scheduled to throw an exception
-            // since it may take some time for the task continuations to be scheduled,
-            // we wait until the cancellation has been observed by all waiting threads
-            // if we don't do this, the cancellation may never be propagated to all waiters,
-            // causing them to hang indefinitely (since the will not, and cannot, ever be released).
-            // we don't expect this to take long, so we can just spin a few times until it's done
-            SpinWait.SpinUntil(() => Volatile.Read(in _waitingCount) == 0);
-            // now it should be safe to dispose the semaphore, because:
-            // - any new attempts to acquire the lock will throw a LockDisposedException
-            // - any waiting async flows have already received the notification to cancel. They are in the process of throwing an LockDisposedException
-            // - the async flow that is currently holding the lock, if any, will be able to release it without issue
-            _semaphore.Dispose();
+            return;
         }
+
+        try
+        {
+            _disposalCancellationSource.Cancel();
+        }
+        finally
+        {
+            // Canceling deliberately cannot finalize resources. Publishing Quiescing only after Cancel
+            // prevents a rejected racing entrant from becoming the last user and disposing the CTS while
+            // the disposer is still trying to signal it.
+            Interlocked.CompareExchange(
+                ref _lifecycleState,
+                (int)LifecycleState.Quiescing,
+                (int)LifecycleState.Canceling);
+            TryFinalizeDisposal();
+        }
+    }
+
+    private enum LifecycleState
+    {
+        Active,
+        Canceling,
+        Quiescing,
+        Disposed
+    }
+
+    private sealed class OwnershipContext
+    {
+        internal OwnershipFrame? Top;
+        internal int Poisoned;
+        internal int RootReleased;
+    }
+
+    private sealed class OwnershipFrame(OwnershipContext context, OwnershipFrame? parent, int depth)
+    {
+        internal OwnershipContext Context { get; } = context;
+
+        internal OwnershipFrame? Parent { get; } = parent;
+
+        internal int Depth { get; } = depth;
+
+        internal int ExitRequested;
+    }
+
+    private readonly record struct ExecutionResult<TResult>(TResult? Result, bool TaskExecuted)
+    {
+        internal static ExecutionResult<TResult> Executed(TResult result) => new(result, TaskExecuted: true);
+
+        internal static ExecutionResult<TResult> Skipped() => new(default, TaskExecuted: false);
     }
 }
