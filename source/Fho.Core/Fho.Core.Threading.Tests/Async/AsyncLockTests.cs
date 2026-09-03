@@ -561,6 +561,287 @@ public sealed class AsyncLockTests
         }
     }
 
+    [TestMethod]
+    public async Task ConcurrentSiblingReentrancyRace_OnlyOneChildCanEnter()
+    {
+        const int ITERATIONS = 64;
+
+        for (int i = 0; i < ITERATIONS; i++)
+        {
+            using AsyncLock asyncLock = new();
+            TaskCompletionSource start = NewSignal();
+            TaskCompletionSource winnerEntered = NewSignal();
+            TaskCompletionSource releaseWinner = NewSignal();
+
+            await asyncLock.RunTaskAsync(async ct =>
+            {
+                Task<bool> RunChild() => Task.Run(async () =>
+                {
+                    await start.Task;
+                    try
+                    {
+                        await asyncLock.RunTaskAsync(async childCt =>
+                        {
+                            winnerEntered.TrySetResult();
+                            await releaseWinner.Task;
+                        });
+                        return true;
+                    }
+                    catch (AsyncLockUsageException)
+                    {
+                        return false;
+                    }
+                }, CancellationToken.None);
+
+                Task<bool> first = RunChild();
+                Task<bool> second = RunChild();
+                start.SetResult();
+
+                await winnerEntered.Task.WaitAsync(s_testTimeout, CancellationToken.None);
+                Task<bool> rejected = await Task.WhenAny(first, second).WaitAsync(s_testTimeout, CancellationToken.None);
+                Assert.IsFalse(await rejected, "A competing sibling should be rejected while the winning child frame is active.");
+
+                releaseWinner.SetResult();
+                bool[] results = await Task.WhenAll(first, second);
+                Assert.AreEqual(1, results.Count(static result => result));
+                Assert.AreEqual(1, results.Count(static result => !result));
+            });
+
+            Assert.AreEqual(0, GetResourceUsers(asyncLock));
+            Assert.AreEqual(1, GetSemaphore(asyncLock).CurrentCount);
+        }
+    }
+
+    [TestMethod]
+    public async Task ThreeLevelOutOfOrderExit_DeepestChildDrainsRequestedAncestors()
+    {
+        using AsyncLock asyncLock = new();
+        TaskCompletionSource grandchildEntered = NewSignal();
+        TaskCompletionSource allowChildExit = NewSignal();
+        TaskCompletionSource releaseGrandchild = NewSignal();
+        Task? child = null;
+        Task? grandchild = null;
+
+        Task outer = asyncLock.RunTaskAsync(async ct =>
+        {
+            child = Task.Run(() => asyncLock.RunTaskAsync(async childCt =>
+            {
+                grandchild = Task.Run(() => asyncLock.RunTaskAsync(async grandchildCt =>
+                {
+                    grandchildEntered.SetResult();
+                    await releaseGrandchild.Task;
+                }), CancellationToken.None);
+
+                await grandchildEntered.Task;
+                await allowChildExit.Task;
+            }), CancellationToken.None);
+
+            await grandchildEntered.Task;
+        });
+
+        await CaptureExceptionAsync<AsyncLockUsageException>(() => outer);
+        Assert.AreEqual(0, GetSemaphore(asyncLock).CurrentCount);
+        Assert.AreEqual(1, GetResourceUsers(asyncLock));
+
+        allowChildExit.SetResult();
+        await CaptureExceptionAsync<AsyncLockUsageException>(() => child!);
+        Assert.AreEqual(0, GetSemaphore(asyncLock).CurrentCount);
+        Assert.AreEqual(1, GetResourceUsers(asyncLock));
+
+        bool waiterRan = false;
+        Task waiter = asyncLock.RunAsync(() => waiterRan = true);
+        Assert.IsFalse(waiter.IsCompleted);
+        Assert.AreEqual(2, GetResourceUsers(asyncLock));
+
+        releaseGrandchild.SetResult();
+        await grandchild!;
+        await waiter.WaitAsync(s_testTimeout);
+
+        Assert.IsTrue(waiterRan);
+        Assert.AreEqual(0, GetResourceUsers(asyncLock));
+        Assert.AreEqual(1, GetSemaphore(asyncLock).CurrentCount);
+    }
+
+    [TestMethod]
+    public async Task DisposeWithManyWaitersAndDisposers_FinalizesAfterAllUsersExit()
+    {
+        const int WAITER_COUNT = 64;
+        const int DISPOSER_COUNT = 16;
+
+        using AsyncLock asyncLock = new();
+        CancellationTokenSource internalCts = GetCancellationSource(asyncLock);
+        TaskCompletionSource holderEntered = NewSignal();
+        TaskCompletionSource releaseHolder = NewSignal();
+
+        Task holder = asyncLock.RunTaskAsync(async ct =>
+        {
+            holderEntered.SetResult();
+            await releaseHolder.Task;
+        });
+        await holderEntered.Task;
+
+        Task<Exception?>[] waiters = Enumerable.Range(0, WAITER_COUNT)
+            .Select(_ => Task.Run(async () =>
+            {
+                try
+                {
+                    await asyncLock.RunAsync(() => { });
+                    return null;
+                }
+                catch (Exception exception)
+                {
+                    return exception;
+                }
+            }))
+            .ToArray();
+
+        await WaitForResourceUsersAsync(asyncLock, expected: WAITER_COUNT + 1);
+
+        Task[] disposers = Enumerable.Range(0, DISPOSER_COUNT)
+            .Select(_ => Task.Run(asyncLock.Dispose))
+            .ToArray();
+        await Task.WhenAll(disposers);
+
+        Exception?[] waiterResults = await Task.WhenAll(waiters);
+        Assert.IsTrue(waiterResults.All(static exception => exception is LockDisposedException));
+        Assert.AreEqual(1, GetResourceUsers(asyncLock));
+        Assert.IsFalse(IsDisposed(internalCts));
+
+        releaseHolder.SetResult();
+        await holder;
+
+        Assert.AreEqual(0, GetResourceUsers(asyncLock));
+        Assert.IsTrue(IsDisposed(internalCts));
+    }
+
+    [TestMethod]
+    public async Task CallerCancellationRacingDispose_ReportsOnlyCallerCancellationOrDisposal()
+    {
+        const int ITERATIONS = 128;
+
+        for (int i = 0; i < ITERATIONS; i++)
+        {
+            using AsyncLock asyncLock = new();
+            using CancellationTokenSource callerCts = new();
+            TaskCompletionSource holderEntered = NewSignal();
+            TaskCompletionSource releaseHolder = NewSignal();
+            TaskCompletionSource start = NewSignal();
+
+            Task holder = asyncLock.RunTaskAsync(async ct =>
+            {
+                holderEntered.SetResult();
+                await releaseHolder.Task;
+            });
+            await holderEntered.Task;
+
+            Task waiter = asyncLock.RunAsync(() => { }, callerCts.Token);
+            await WaitForResourceUsersAsync(asyncLock, expected: 2);
+
+            Task cancelCaller = Task.Run(async () =>
+            {
+                await start.Task;
+                await callerCts.CancelAsync();
+            });
+            Task dispose = Task.Run(async () =>
+            {
+                await start.Task;
+                asyncLock.Dispose();
+            });
+
+            start.SetResult();
+
+            Exception? waiterFailure = null;
+            try
+            {
+                await waiter;
+            }
+            catch (Exception exception)
+            {
+                waiterFailure = exception;
+            }
+
+            await Task.WhenAll(cancelCaller, dispose);
+
+            Assert.IsNotNull(waiterFailure);
+            Assert.IsTrue(waiterFailure is LockDisposedException or OperationCanceledException,
+                $"Unexpected cancellation/disposal race exception: {waiterFailure?.GetType().FullName ?? "<none>"}");
+            if (waiterFailure is OperationCanceledException cancellationException)
+            {
+                Assert.AreEqual(callerCts.Token, cancellationException.CancellationToken);
+            }
+
+            releaseHolder.SetResult();
+            await holder;
+
+            Assert.AreEqual(0, GetResourceUsers(asyncLock));
+            Assert.IsTrue(IsDisposed(GetCancellationSource(asyncLock)));
+        }
+    }
+
+    [TestMethod]
+    public async Task ConcurrentAcquirersAndDisposers_QuiesceWithoutLifetimeLeaks()
+    {
+        const int ITERATIONS = 64;
+        const int ACQUIRER_COUNT = 16;
+        const int DISPOSER_COUNT = 4;
+
+        for (int i = 0; i < ITERATIONS; i++)
+        {
+            using AsyncLock asyncLock = new();
+            TaskCompletionSource start = NewSignal();
+
+            Task<AsyncLockResult>[] runners = Enumerable.Range(0, ACQUIRER_COUNT)
+                .Select(_ => Task.Run(async () =>
+                {
+                    await start.Task;
+                    return await asyncLock.TryRunTaskAsync(async ct => await Task.Yield());
+                }))
+                .ToArray();
+
+            Task[] disposers = Enumerable.Range(0, DISPOSER_COUNT)
+                .Select(_ => Task.Run(async () =>
+                {
+                    await start.Task;
+                    asyncLock.Dispose();
+                }))
+                .ToArray();
+
+            start.SetResult();
+            await Task.WhenAll(runners.Cast<Task>().Concat(disposers));
+
+            Assert.AreEqual(0, GetResourceUsers(asyncLock));
+            Assert.IsTrue(IsDisposed(GetCancellationSource(asyncLock)));
+        }
+    }
+
+    [TestMethod]
+    public async Task DisposeInsideNestedReentrantDelegate_DefersPhysicalDisposalUntilRootExit()
+    {
+        using AsyncLock asyncLock = new();
+        CancellationTokenSource internalCts = GetCancellationSource(asyncLock);
+        bool outerContinued = false;
+
+        await asyncLock.RunTaskAsync(async ct =>
+        {
+            await asyncLock.RunTaskAsync(async nestedCt =>
+            {
+                asyncLock.Dispose();
+
+                Assert.IsFalse(IsDisposed(internalCts));
+                Assert.AreEqual(1, GetResourceUsers(asyncLock));
+                await CaptureExceptionAsync<LockDisposedException>(async () => await asyncLock.RunAsync(() => { }));
+            }, ct);
+
+            Assert.IsFalse(IsDisposed(internalCts));
+            Assert.AreEqual(1, GetResourceUsers(asyncLock));
+            outerContinued = true;
+        });
+
+        Assert.IsTrue(outerContinued);
+        Assert.AreEqual(0, GetResourceUsers(asyncLock));
+        Assert.IsTrue(IsDisposed(internalCts));
+    }
+
     private static TaskCompletionSource NewSignal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     private static async Task<TException> CaptureExceptionAsync<TException>(Func<Task> action)
