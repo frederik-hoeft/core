@@ -452,7 +452,7 @@ public ref struct ConcurrentBitmap56
     /// <summary>
     /// Converts the specified <see cref="ConcurrentBitmap56"/> to its underlying <see cref="ConcurrentBitmap56State"/> state.
     /// </summary>
-    public static explicit operator ConcurrentBitmap56State(ConcurrentBitmap56 value) => 
+    public static explicit operator ConcurrentBitmap56State(ConcurrentBitmap56 value) =>
         // we can do this because the struct size is the same
         Unsafe.BitCast<ConcurrentBitmap56, ConcurrentBitmap56State>(value);
 

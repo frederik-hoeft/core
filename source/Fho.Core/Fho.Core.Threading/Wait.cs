@@ -2,13 +2,13 @@
 
 public static class Wait
 {
-    public static bool Until(Func<bool> condition) => 
+    public static bool Until(Func<bool> condition) =>
         Until(condition, Timeout.InfiniteTimeSpan, TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(20));
 
-    public static bool Until(Func<bool> condition, TimeSpan timeout) => 
+    public static bool Until(Func<bool> condition, TimeSpan timeout) =>
         Until(condition, timeout, TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(20));
 
-    public static bool Until(Func<bool> condition, TimeSpan timeout, TimeSpan spinTimeout, TimeSpan sleepDuration) => 
+    public static bool Until(Func<bool> condition, TimeSpan timeout, TimeSpan spinTimeout, TimeSpan sleepDuration) =>
         Until(condition, (int)timeout.TotalMilliseconds, (int)spinTimeout.TotalMilliseconds, (int)sleepDuration.TotalMilliseconds);
 
     public static bool Until(Func<bool> condition, int timeoutMillis = -1, int spinTimeoutMillis = 100, int sleepDurationMillis = 20)

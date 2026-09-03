@@ -1,8 +1,8 @@
-﻿using System.Diagnostics;
-using System.Text;
+﻿using Fho.Core.Extensions;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Text;
 using static Fho.Core.Threading.Collections.ConcurrentBitmap;
-using Fho.Core.Extensions;
 
 namespace Fho.Core.Threading.Collections.BitmapInternals;
 
@@ -270,7 +270,7 @@ internal sealed class ConcurrentBitmapClusterNode : ConcurrentBitmapNode
             // --> mark the segment as full
             snapshot = snapshot.SetChildFull(segment);
         }
-        else if (!segmentState.IsEmptyUnsafe(segmentCapacity) && snapshot.IsChildEmpty(segment) 
+        else if (!segmentState.IsEmptyUnsafe(segmentCapacity) && snapshot.IsChildEmpty(segment)
             || !segmentState.IsFullUnsafe(segmentCapacity) && snapshot.IsChildFull(segment))
         {
             // the segment is neither full nor empty, but the cluster bitmap says otherwise
@@ -305,7 +305,7 @@ internal sealed class ConcurrentBitmapClusterNode : ConcurrentBitmapNode
             if (i == segment)
             {
                 lastBit = ConcurrentBitmap56.VolatileRead(ref _segments[i]).IsBitSet(currentSegmentSize - 1);
-                ConcurrentBitmap56.InsertBitAt(ref _segments[i] , segmentOffset, value);
+                ConcurrentBitmap56.InsertBitAt(ref _segments[i], segmentOffset, value);
             }
             else
             {

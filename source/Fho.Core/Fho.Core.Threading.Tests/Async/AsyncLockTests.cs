@@ -9,17 +9,20 @@ namespace Fho.Core.Threading.Tests.Async;
 [TestClass]
 public sealed class AsyncLockTests
 {
+    public required TestContext TestContext { get; set; }
+
     private static readonly TimeSpan s_testTimeout = TimeSpan.FromSeconds(2);
 
     [TestMethod]
-    public async Task RunTaskAsync_SerializesConcurrentCallers()
+    public async Task TestRunTaskAsync_SerializesConcurrentCallersAsync()
     {
         using AsyncLock asyncLock = new();
         int active = 0;
         bool overlapped = false;
 
-        Task[] tasks = Enumerable.Range(0, 32)
-            .Select(_ => asyncLock.RunTaskAsync(async ct =>
+        Task[] tasks =
+        [
+            .. Enumerable.Range(0, 32).Select(_ => asyncLock.RunTaskAsync(async ct =>
             {
                 if (Interlocked.Increment(ref active) != 1)
                 {
@@ -28,8 +31,8 @@ public sealed class AsyncLockTests
 
                 await Task.Yield();
                 Interlocked.Decrement(ref active);
-            }))
-            .ToArray();
+            }, TestContext.CancellationToken))
+        ];
 
         await Task.WhenAll(tasks);
         Assert.IsFalse(overlapped);
@@ -37,7 +40,7 @@ public sealed class AsyncLockTests
     }
 
     [TestMethod]
-    public async Task RunTaskAsync_ReentersAcrossAwaitBoundaries()
+    public async Task TestRunTaskAsync_ReentersAcrossAwaitBoundariesAsync()
     {
         using AsyncLock asyncLock = new();
         int nestedRuns = 0;
@@ -59,44 +62,44 @@ public sealed class AsyncLockTests
             }, ct);
 
             Assert.IsTrue(asyncLock.IsHeld);
-        });
+        }, TestContext.CancellationToken);
 
         Assert.AreEqual(2, nestedRuns);
         Assert.IsFalse(asyncLock.IsHeld);
     }
 
     [TestMethod]
-    public async Task RunMethods_ReturnDelegateResults()
+    public async Task TestRunMethods_ReturnDelegateResultsAsync()
     {
         using AsyncLock asyncLock = new();
 
-        int synchronousResult = await asyncLock.RunAsync(() => 42);
+        int synchronousResult = await asyncLock.RunAsync(() => 42, TestContext.CancellationToken);
         int asynchronousResult = await asyncLock.RunTaskAsync(async ct =>
         {
             await Task.Yield();
             return 7;
-        });
+        }, TestContext.CancellationToken);
 
         Assert.AreEqual(42, synchronousResult);
         Assert.AreEqual(7, asynchronousResult);
     }
 
     [TestMethod]
-    public async Task NullDelegates_AreRejectedBeforeAcquisition()
+    public async Task TestNullDelegates_AreRejectedBeforeAcquisitionAsync()
     {
         using AsyncLock asyncLock = new();
 
-        await CaptureExceptionAsync<ArgumentNullException>(async () => await asyncLock.RunAsync((Action)null!));
-        await CaptureExceptionAsync<ArgumentNullException>(async () => await asyncLock.RunTaskAsync((Func<CancellationToken, Task>)null!));
-        await CaptureExceptionAsync<ArgumentNullException>(async () => await asyncLock.TryRunAsync((Action)null!));
-        await CaptureExceptionAsync<ArgumentNullException>(async () => await asyncLock.TryRunTaskAsync((Func<CancellationToken, Task>)null!));
+        await CaptureExceptionAsync<ArgumentNullException>(async () => await asyncLock.RunAsync(null!, TestContext.CancellationToken));
+        await CaptureExceptionAsync<ArgumentNullException>(async () => await asyncLock.RunTaskAsync(null!, TestContext.CancellationToken));
+        await CaptureExceptionAsync<ArgumentNullException>(async () => await asyncLock.TryRunAsync(null!, TestContext.CancellationToken));
+        await CaptureExceptionAsync<ArgumentNullException>(async () => await asyncLock.TryRunTaskAsync(null!, TestContext.CancellationToken));
 
         Assert.IsFalse(asyncLock.IsHeld);
         Assert.AreEqual(0, GetResourceUsers(asyncLock));
     }
 
     [TestMethod]
-    public async Task ConcurrentSiblingReentrancy_IsRejected()
+    public async Task TestConcurrentSiblingReentrancy_IsRejectedAsync()
     {
         using AsyncLock asyncLock = new();
         TaskCompletionSource childEntered = NewSignal();
@@ -109,22 +112,22 @@ public sealed class AsyncLockTests
             {
                 childEntered.SetResult();
                 await releaseChild.Task;
-            }));
+            }, TestContext.CancellationToken), TestContext.CancellationToken);
 
             await childEntered.Task;
 
-            Task secondChild = Task.Run(() => asyncLock.RunAsync(() => { }));
+            Task secondChild = Task.Run(() => asyncLock.RunAsync(() => { }, TestContext.CancellationToken), TestContext.CancellationToken);
             await CaptureExceptionAsync<AsyncLockUsageException>(() => secondChild);
 
             releaseChild.SetResult();
             await firstChild;
-        });
+        }, TestContext.CancellationToken);
 
         Assert.IsFalse(asyncLock.IsHeld);
     }
 
     [TestMethod]
-    public async Task ParentReentrancyWhileChildFrameIsActive_IsRejected()
+    public async Task TestParentReentrancyWhileChildFrameIsActive_IsRejectedAsync()
     {
         using AsyncLock asyncLock = new();
         TaskCompletionSource childEntered = NewSignal();
@@ -137,18 +140,18 @@ public sealed class AsyncLockTests
             {
                 childEntered.SetResult();
                 await releaseChild.Task;
-            }));
+            }, TestContext.CancellationToken), TestContext.CancellationToken);
 
             await childEntered.Task;
-            await CaptureExceptionAsync<AsyncLockUsageException>(async () => await asyncLock.RunAsync(() => { }));
+            await CaptureExceptionAsync<AsyncLockUsageException>(async () => await asyncLock.RunAsync(() => { }, TestContext.CancellationToken));
 
             releaseChild.SetResult();
             await child;
-        });
+        }, TestContext.CancellationToken);
     }
 
     [TestMethod]
-    public async Task PoisonedOwnershipContext_RejectsFurtherReentrancy()
+    public async Task TestPoisonedOwnershipContext_RejectsFurtherReentrancyAsync()
     {
         using AsyncLock asyncLock = new();
         TaskCompletionSource childEntered = NewSignal();
@@ -161,20 +164,20 @@ public sealed class AsyncLockTests
             {
                 childEntered.SetResult();
                 await releaseChild.Task;
-            }));
+            }, TestContext.CancellationToken), TestContext.CancellationToken);
 
             await childEntered.Task;
-            await CaptureExceptionAsync<AsyncLockUsageException>(async () => await asyncLock.RunAsync(() => { }));
+            await CaptureExceptionAsync<AsyncLockUsageException>(async () => await asyncLock.RunAsync(() => { }, TestContext.CancellationToken));
 
             releaseChild.SetResult();
             await child;
 
-            await CaptureExceptionAsync<AsyncLockUsageException>(async () => await asyncLock.RunAsync(() => { }));
-        });
+            await CaptureExceptionAsync<AsyncLockUsageException>(async () => await asyncLock.RunAsync(() => { }, TestContext.CancellationToken));
+        }, TestContext.CancellationToken);
     }
 
     [TestMethod]
-    public async Task ParentExitWithActiveOrphan_ThrowsWithoutReleasingSemaphore()
+    public async Task TestParentExitWithActiveOrphan_ThrowsWithoutReleasingSemaphoreAsync()
     {
         using AsyncLock asyncLock = new();
         TaskCompletionSource childEntered = NewSignal();
@@ -187,17 +190,17 @@ public sealed class AsyncLockTests
             {
                 childEntered.SetResult();
                 await releaseChild.Task;
-            }));
+            }, TestContext.CancellationToken), TestContext.CancellationToken);
 
             await childEntered.Task;
-        });
+        }, TestContext.CancellationToken);
 
         await CaptureExceptionAsync<AsyncLockUsageException>(() => outer);
         Assert.AreEqual(0, GetSemaphore(asyncLock).CurrentCount);
         Assert.AreEqual(1, GetResourceUsers(asyncLock));
 
         bool waiterRan = false;
-        Task waiter = asyncLock.RunAsync(() => waiterRan = true);
+        Task waiter = asyncLock.RunAsync(() => waiterRan = true, TestContext.CancellationToken);
         Assert.IsFalse(waiter.IsCompleted);
 
         releaseChild.SetResult();
@@ -209,7 +212,7 @@ public sealed class AsyncLockTests
     }
 
     [TestMethod]
-    public async Task StaleInheritedOwnership_IsRejectedAfterRootExit()
+    public async Task TestStaleInheritedOwnership_IsRejectedAfterRootExitAsync()
     {
         using AsyncLock asyncLock = new();
         TaskCompletionSource childStarted = NewSignal();
@@ -222,18 +225,18 @@ public sealed class AsyncLockTests
             {
                 childStarted.SetResult();
                 await continueChild.Task;
-                await asyncLock.RunAsync(() => { });
-            });
+                await asyncLock.RunAsync(() => { }, TestContext.CancellationToken);
+            }, TestContext.CancellationToken);
 
             await childStarted.Task;
-        });
+        }, TestContext.CancellationToken);
 
         continueChild.SetResult();
         await CaptureExceptionAsync<AsyncLockUsageException>(() => staleChild!);
     }
 
     [TestMethod]
-    public async Task SuppressedExecutionContext_DoesNotInheritReentrantOwnership()
+    public async Task TestSuppressedExecutionContext_DoesNotInheritReentrantOwnershipAsync()
     {
         using AsyncLock asyncLock = new();
         TaskCompletionSource childStarted = NewSignal();
@@ -247,20 +250,20 @@ public sealed class AsyncLockTests
                 child = Task.Run(async () =>
                 {
                     childStarted.SetResult();
-                    await asyncLock.RunAsync(() => childRan = true);
-                });
+                    await asyncLock.RunAsync(() => childRan = true, TestContext.CancellationToken);
+                }, TestContext.CancellationToken);
             }
 
             await childStarted.Task;
             Assert.IsFalse(child!.IsCompleted);
-        });
+        }, TestContext.CancellationToken);
 
         await child!;
         Assert.IsTrue(childRan);
     }
 
     [TestMethod]
-    public void DisposeWithoutUsers_PhysicallyDisposesInline()
+    public void TestDisposeWithoutUsers_PhysicallyDisposesInline()
     {
         using AsyncLock asyncLock = new();
         CancellationTokenSource internalCts = GetCancellationSource(asyncLock);
@@ -273,7 +276,7 @@ public sealed class AsyncLockTests
     }
 
     [TestMethod]
-    public async Task DisposeWithHolder_DefersPhysicalDisposalUntilHolderExits()
+    public async Task TestDisposeWithHolder_DefersPhysicalDisposalUntilHolderExitsAsync()
     {
         using AsyncLock asyncLock = new();
         CancellationTokenSource internalCts = GetCancellationSource(asyncLock);
@@ -284,7 +287,7 @@ public sealed class AsyncLockTests
         {
             entered.SetResult();
             await release.Task;
-        });
+        }, TestContext.CancellationToken);
 
         await entered.Task;
         asyncLock.Dispose();
@@ -300,7 +303,7 @@ public sealed class AsyncLockTests
     }
 
     [TestMethod]
-    public async Task DisposeWithWaiter_WakesWaiterAndWaitsForAllResourceUsersToExit()
+    public async Task TestDisposeWithWaiter_WakesWaiterAndWaitsForAllResourceUsersToExitAsync()
     {
         using AsyncLock asyncLock = new();
         CancellationTokenSource internalCts = GetCancellationSource(asyncLock);
@@ -311,10 +314,10 @@ public sealed class AsyncLockTests
         {
             holderEntered.SetResult();
             await releaseHolder.Task;
-        });
+        }, TestContext.CancellationToken);
 
         await holderEntered.Task;
-        Task waiter = asyncLock.RunAsync(() => { });
+        Task waiter = asyncLock.RunAsync(() => { }, TestContext.CancellationToken);
         await WaitForResourceUsersAsync(asyncLock, expected: 2);
 
         asyncLock.Dispose();
@@ -330,7 +333,7 @@ public sealed class AsyncLockTests
     }
 
     [TestMethod]
-    public async Task LastExitingWaiter_FinalizesAfterHolderHasAlreadyExited()
+    public async Task TestLastExitingWaiter_FinalizesAfterHolderHasAlreadyExitedAsync()
     {
         using AsyncLock asyncLock = new();
         CancellationTokenSource internalCts = GetCancellationSource(asyncLock);
@@ -343,7 +346,7 @@ public sealed class AsyncLockTests
         {
             holderEntered.SetResult();
             await releaseHolder.Task;
-        });
+        }, TestContext.CancellationToken);
         await holderEntered.Task;
 
         Task waiter = StartWaiterOnPausedSynchronizationContext(asyncLock, waiterStarted, allowWaiterPump);
@@ -365,7 +368,7 @@ public sealed class AsyncLockTests
     }
 
     [TestMethod]
-    public async Task DisposeOnSingleThreadedTaskScheduler_DoesNotWaitForCapturedWaiterContinuation()
+    public async Task TestDisposeOnSingleThreadedTaskScheduler_DoesNotWaitForCapturedWaiterContinuationAsync()
     {
         using SingleThreadTaskScheduler scheduler = new();
         using AsyncLock asyncLock = new();
@@ -377,25 +380,25 @@ public sealed class AsyncLockTests
         {
             holderEntered.SetResult();
             await releaseHolder.Task;
-        }));
+        }, TestContext.CancellationToken), TestContext.CancellationToken);
         await holderEntered.Task;
 
         Task scenario = Task.Factory.StartNew(async () =>
         {
-            Task waiter = asyncLock.RunAsync(() => { });
+            Task waiter = asyncLock.RunAsync(() => { }, TestContext.CancellationToken);
             asyncLock.Dispose();
             disposeReturned.SetResult();
             releaseHolder.SetResult();
             await CaptureExceptionAsync<LockDisposedException>(() => waiter);
         }, CancellationToken.None, TaskCreationOptions.DenyChildAttach, scheduler).Unwrap();
 
-        await disposeReturned.Task.WaitAsync(s_testTimeout);
-        await scenario.WaitAsync(s_testTimeout);
+        await disposeReturned.Task.WaitAsync(s_testTimeout, TestContext.CancellationToken);
+        await scenario.WaitAsync(s_testTimeout, TestContext.CancellationToken);
         await holder;
     }
 
     [TestMethod]
-    public async Task DisposeOnSingleThreadedSynchronizationContext_DoesNotWaitForWaiterContinuation()
+    public async Task TestDisposeOnSingleThreadedSynchronizationContext_DoesNotWaitForWaiterContinuationAsync()
     {
         using AsyncLock asyncLock = new();
         TaskCompletionSource holderEntered = NewSignal();
@@ -405,23 +408,23 @@ public sealed class AsyncLockTests
         {
             holderEntered.SetResult();
             await releaseHolder.Task;
-        }));
+        }, TestContext.CancellationToken), TestContext.CancellationToken);
         await holderEntered.Task;
 
         Task scenario = RunOnDedicatedSynchronizationContext(async () =>
         {
-            Task waiter = asyncLock.RunAsync(() => { });
+            Task waiter = asyncLock.RunAsync(() => { }, TestContext.CancellationToken);
             asyncLock.Dispose();
             releaseHolder.SetResult();
             await CaptureExceptionAsync<LockDisposedException>(() => waiter);
         });
 
-        await scenario.WaitAsync(s_testTimeout);
+        await scenario.WaitAsync(s_testTimeout, TestContext.CancellationToken);
         await holder;
     }
 
     [TestMethod]
-    public async Task CallerCancellationWhileWaiting_PreservesCallerToken()
+    public async Task TestCallerCancellationWhileWaiting_PreservesCallerTokenAsync()
     {
         using AsyncLock asyncLock = new();
         TaskCompletionSource holderEntered = NewSignal();
@@ -432,12 +435,12 @@ public sealed class AsyncLockTests
         {
             holderEntered.SetResult();
             await releaseHolder.Task;
-        });
+        }, TestContext.CancellationToken);
         await holderEntered.Task;
 
         Task waiter = asyncLock.RunAsync(() => { }, callerCts.Token);
         await WaitForResourceUsersAsync(asyncLock, expected: 2);
-        callerCts.Cancel();
+        await callerCts.CancelAsync();
 
         OperationCanceledException exception = await CaptureExceptionAsync<OperationCanceledException>(() => waiter);
         Assert.AreEqual(callerCts.Token, exception.CancellationToken);
@@ -447,53 +450,53 @@ public sealed class AsyncLockTests
     }
 
     [TestMethod]
-    public async Task RunAsync_DisposalBeforeExecutionThrowsLockDisposedException()
+    public async Task TestRunAsync_DisposalBeforeExecutionThrowsLockDisposedExceptionAsync()
     {
         using AsyncLock asyncLock = new();
         asyncLock.Dispose();
 
-        await CaptureExceptionAsync<LockDisposedException>(async () => await asyncLock.RunAsync(() => { }));
+        await CaptureExceptionAsync<LockDisposedException>(async () => await asyncLock.RunAsync(() => { }, TestContext.CancellationToken));
     }
 
     [TestMethod]
-    public async Task TryRunAsync_DisposalReturnsSkipped()
+    public async Task TestTryRunAsync_DisposalReturnsSkippedAsync()
     {
         using AsyncLock asyncLock = new();
         asyncLock.Dispose();
 
-        AsyncLockResult result = await asyncLock.TryRunAsync(() => { });
-        AsyncLockResult<int> genericResult = await asyncLock.TryRunAsync(() => 42);
+        AsyncLockResult result = await asyncLock.TryRunAsync(() => { }, TestContext.CancellationToken);
+        AsyncLockResult<int> genericResult = await asyncLock.TryRunAsync(() => 42, TestContext.CancellationToken);
 
         Assert.IsFalse(result.TaskExecuted);
         Assert.IsFalse(genericResult.TaskExecuted);
     }
 
     [TestMethod]
-    public async Task TryRunAsync_CallerLockDisposedExceptionPropagates()
+    public async Task TestTryRunAsync_CallerLockDisposedExceptionPropagatesAsync()
     {
         using AsyncLock asyncLock = new();
 
         LockDisposedException expected = new(objectName: null, message: "caller failure");
         LockDisposedException exception = await CaptureExceptionAsync<LockDisposedException>(async () =>
-            await asyncLock.TryRunAsync((Action)(() => throw expected)));
+            await asyncLock.TryRunAsync(() => throw expected, TestContext.CancellationToken));
 
         Assert.IsTrue(ReferenceEquals(expected, exception));
     }
 
     [TestMethod]
-    public async Task TryRunTaskAsync_CallerExceptionPropagates()
+    public async Task TestTryRunTaskAsync_CallerExceptionPropagatesAsync()
     {
         using AsyncLock asyncLock = new();
 
         InvalidOperationException expected = new("caller failure");
         InvalidOperationException exception = await CaptureExceptionAsync<InvalidOperationException>(async () =>
-            await asyncLock.TryRunTaskAsync(_ => Task.FromException(expected)));
+            await asyncLock.TryRunTaskAsync(_ => Task.FromException(expected), TestContext.CancellationToken));
 
         Assert.IsTrue(ReferenceEquals(expected, exception));
     }
 
     [TestMethod]
-    public async Task ReentrantAcquisitionAfterDispose_IsRejectedWhileCurrentHolderMayFinish()
+    public async Task TestReentrantAcquisitionAfterDispose_IsRejectedWhileCurrentHolderMayFinishAsync()
     {
         using AsyncLock asyncLock = new();
         bool outerFinished = false;
@@ -501,29 +504,27 @@ public sealed class AsyncLockTests
         await asyncLock.RunTaskAsync(async ct =>
         {
             asyncLock.Dispose();
-            await CaptureExceptionAsync<LockDisposedException>(async () => await asyncLock.RunAsync(() => { }));
+            await CaptureExceptionAsync<LockDisposedException>(async () => await asyncLock.RunAsync(() => { }, TestContext.CancellationToken));
             outerFinished = true;
-        });
+        }, TestContext.CancellationToken);
 
         Assert.IsTrue(outerFinished);
         Assert.IsTrue(IsDisposed(GetCancellationSource(asyncLock)));
     }
 
     [TestMethod]
-    public async Task ConcurrentDispose_IsIdempotent()
+    public async Task TestConcurrentDispose_IsIdempotentAsync()
     {
         using AsyncLock asyncLock = new();
 
-        Task[] disposers = Enumerable.Range(0, 32)
-            .Select(_ => Task.Run(asyncLock.Dispose))
-            .ToArray();
+        Task[] disposers = [.. Enumerable.Range(0, 32).Select(_ => Task.Run(asyncLock.Dispose, TestContext.CancellationToken))];
 
         await Task.WhenAll(disposers);
         Assert.IsTrue(IsDisposed(GetCancellationSource(asyncLock)));
     }
 
     [TestMethod]
-    public async Task ConcurrentAcquisitionAndDispose_DoNotLeakObjectDisposedException()
+    public async Task TestConcurrentAcquisitionAndDispose_DoNotLeakObjectDisposedExceptionAsync()
     {
         const int ITERATIONS = 256;
 
@@ -537,7 +538,7 @@ public sealed class AsyncLockTests
                 await start.Task;
                 try
                 {
-                    await asyncLock.RunAsync(() => { });
+                    await asyncLock.RunAsync(() => { }, TestContext.CancellationToken);
                     return null;
                 }
                 catch (Exception exception)
@@ -550,7 +551,7 @@ public sealed class AsyncLockTests
             {
                 await start.Task;
                 asyncLock.Dispose();
-            });
+            }, TestContext.CancellationToken);
 
             start.SetResult();
             Exception? exception = await runner;
@@ -562,7 +563,7 @@ public sealed class AsyncLockTests
     }
 
     [TestMethod]
-    public async Task ConcurrentSiblingReentrancyRace_OnlyOneChildCanEnter()
+    public async Task TestConcurrentSiblingReentrancyRace_OnlyOneChildCanEnterAsync()
     {
         const int ITERATIONS = 64;
 
@@ -584,7 +585,7 @@ public sealed class AsyncLockTests
                         {
                             winnerEntered.TrySetResult();
                             await releaseWinner.Task;
-                        });
+                        }, TestContext.CancellationToken);
                         return true;
                     }
                     catch (AsyncLockUsageException)
@@ -605,7 +606,7 @@ public sealed class AsyncLockTests
                 bool[] results = await Task.WhenAll(first, second);
                 Assert.AreEqual(1, results.Count(static result => result));
                 Assert.AreEqual(1, results.Count(static result => !result));
-            });
+            }, TestContext.CancellationToken);
 
             Assert.AreEqual(0, GetResourceUsers(asyncLock));
             Assert.AreEqual(1, GetSemaphore(asyncLock).CurrentCount);
@@ -613,7 +614,7 @@ public sealed class AsyncLockTests
     }
 
     [TestMethod]
-    public async Task ThreeLevelOutOfOrderExit_DeepestChildDrainsRequestedAncestors()
+    public async Task TestThreeLevelOutOfOrderExit_DeepestChildDrainsRequestedAncestorsAsync()
     {
         using AsyncLock asyncLock = new();
         TaskCompletionSource grandchildEntered = NewSignal();
@@ -630,14 +631,14 @@ public sealed class AsyncLockTests
                 {
                     grandchildEntered.SetResult();
                     await releaseGrandchild.Task;
-                }), CancellationToken.None);
+                }, TestContext.CancellationToken), CancellationToken.None);
 
                 await grandchildEntered.Task;
                 await allowChildExit.Task;
-            }), CancellationToken.None);
+            }, TestContext.CancellationToken), CancellationToken.None);
 
             await grandchildEntered.Task;
-        });
+        }, TestContext.CancellationToken);
 
         await CaptureExceptionAsync<AsyncLockUsageException>(() => outer);
         Assert.AreEqual(0, GetSemaphore(asyncLock).CurrentCount);
@@ -649,13 +650,13 @@ public sealed class AsyncLockTests
         Assert.AreEqual(1, GetResourceUsers(asyncLock));
 
         bool waiterRan = false;
-        Task waiter = asyncLock.RunAsync(() => waiterRan = true);
+        Task waiter = asyncLock.RunAsync(() => waiterRan = true, TestContext.CancellationToken);
         Assert.IsFalse(waiter.IsCompleted);
         Assert.AreEqual(2, GetResourceUsers(asyncLock));
 
         releaseGrandchild.SetResult();
         await grandchild!;
-        await waiter.WaitAsync(s_testTimeout);
+        await waiter.WaitAsync(s_testTimeout, TestContext.CancellationToken);
 
         Assert.IsTrue(waiterRan);
         Assert.AreEqual(0, GetResourceUsers(asyncLock));
@@ -663,7 +664,7 @@ public sealed class AsyncLockTests
     }
 
     [TestMethod]
-    public async Task DisposeWithManyWaitersAndDisposers_FinalizesAfterAllUsersExit()
+    public async Task TestDisposeWithManyWaitersAndDisposers_FinalizesAfterAllUsersExitAsync()
     {
         const int WAITER_COUNT = 64;
         const int DISPOSER_COUNT = 16;
@@ -677,15 +678,16 @@ public sealed class AsyncLockTests
         {
             holderEntered.SetResult();
             await releaseHolder.Task;
-        });
+        }, TestContext.CancellationToken);
         await holderEntered.Task;
 
-        Task<Exception?>[] waiters = Enumerable.Range(0, WAITER_COUNT)
-            .Select(_ => Task.Run(async () =>
+        Task<Exception?>[] waiters =
+        [
+            .. Enumerable.Range(0, WAITER_COUNT).Select(_ => Task.Run(async () =>
             {
                 try
                 {
-                    await asyncLock.RunAsync(() => { });
+                    await asyncLock.RunAsync(() => { }, TestContext.CancellationToken);
                     return null;
                 }
                 catch (Exception exception)
@@ -693,13 +695,11 @@ public sealed class AsyncLockTests
                     return exception;
                 }
             }))
-            .ToArray();
+        ];
 
         await WaitForResourceUsersAsync(asyncLock, expected: WAITER_COUNT + 1);
 
-        Task[] disposers = Enumerable.Range(0, DISPOSER_COUNT)
-            .Select(_ => Task.Run(asyncLock.Dispose))
-            .ToArray();
+        Task[] disposers = [.. Enumerable.Range(0, DISPOSER_COUNT).Select(_ => Task.Run(asyncLock.Dispose, TestContext.CancellationToken))];
         await Task.WhenAll(disposers);
 
         Exception?[] waiterResults = await Task.WhenAll(waiters);
@@ -715,7 +715,7 @@ public sealed class AsyncLockTests
     }
 
     [TestMethod]
-    public async Task CallerCancellationRacingDispose_ReportsOnlyCallerCancellationOrDisposal()
+    public async Task TestCallerCancellationRacingDispose_ReportsOnlyCallerCancellationOrDisposalAsync()
     {
         const int ITERATIONS = 128;
 
@@ -731,7 +731,7 @@ public sealed class AsyncLockTests
             {
                 holderEntered.SetResult();
                 await releaseHolder.Task;
-            });
+            }, TestContext.CancellationToken);
             await holderEntered.Task;
 
             Task waiter = asyncLock.RunAsync(() => { }, callerCts.Token);
@@ -741,12 +741,12 @@ public sealed class AsyncLockTests
             {
                 await start.Task;
                 await callerCts.CancelAsync();
-            });
+            }, TestContext.CancellationToken);
             Task dispose = Task.Run(async () =>
             {
                 await start.Task;
                 asyncLock.Dispose();
-            });
+            }, TestContext.CancellationToken);
 
             start.SetResult();
 
@@ -779,7 +779,7 @@ public sealed class AsyncLockTests
     }
 
     [TestMethod]
-    public async Task ConcurrentAcquirersAndDisposers_QuiesceWithoutLifetimeLeaks()
+    public async Task TestConcurrentAcquirersAndDisposers_QuiesceWithoutLifetimeLeaksAsync()
     {
         const int ITERATIONS = 64;
         const int ACQUIRER_COUNT = 16;
@@ -790,21 +790,23 @@ public sealed class AsyncLockTests
             using AsyncLock asyncLock = new();
             TaskCompletionSource start = NewSignal();
 
-            Task<AsyncLockResult>[] runners = Enumerable.Range(0, ACQUIRER_COUNT)
-                .Select(_ => Task.Run(async () =>
+            Task<AsyncLockResult>[] runners =
+            [
+                .. Enumerable.Range(0, ACQUIRER_COUNT).Select(_ => Task.Run(async () =>
                 {
                     await start.Task;
-                    return await asyncLock.TryRunTaskAsync(async ct => await Task.Yield());
-                }))
-                .ToArray();
+                    return await asyncLock.TryRunTaskAsync(async ct => await Task.Yield(), TestContext.CancellationToken);
+                }, TestContext.CancellationToken))
+            ];
 
-            Task[] disposers = Enumerable.Range(0, DISPOSER_COUNT)
-                .Select(_ => Task.Run(async () =>
+            Task[] disposers =
+            [
+                .. Enumerable.Range(0, DISPOSER_COUNT).Select(_ => Task.Run(async () =>
                 {
                     await start.Task;
                     asyncLock.Dispose();
-                }))
-                .ToArray();
+                }, TestContext.CancellationToken))
+            ];
 
             start.SetResult();
             await Task.WhenAll(runners.Cast<Task>().Concat(disposers));
@@ -815,7 +817,7 @@ public sealed class AsyncLockTests
     }
 
     [TestMethod]
-    public async Task DisposeInsideNestedReentrantDelegate_DefersPhysicalDisposalUntilRootExit()
+    public async Task TestDisposeInsideNestedReentrantDelegate_DefersPhysicalDisposalUntilRootExitAsync()
     {
         using AsyncLock asyncLock = new();
         CancellationTokenSource internalCts = GetCancellationSource(asyncLock);
@@ -829,13 +831,13 @@ public sealed class AsyncLockTests
 
                 Assert.IsFalse(IsDisposed(internalCts));
                 Assert.AreEqual(1, GetResourceUsers(asyncLock));
-                await CaptureExceptionAsync<LockDisposedException>(async () => await asyncLock.RunAsync(() => { }));
+                await CaptureExceptionAsync<LockDisposedException>(async () => await asyncLock.RunAsync(() => { }, TestContext.CancellationToken));
             }, ct);
 
             Assert.IsFalse(IsDisposed(internalCts));
             Assert.AreEqual(1, GetResourceUsers(asyncLock));
             outerContinued = true;
-        });
+        }, TestContext.CancellationToken);
 
         Assert.IsTrue(outerContinued);
         Assert.AreEqual(0, GetResourceUsers(asyncLock));
@@ -968,7 +970,7 @@ public sealed class AsyncLockTests
 
     private sealed class SingleThreadSynchronizationContext : SynchronizationContext, IDisposable
     {
-        private readonly BlockingCollection<(SendOrPostCallback Callback, object? State)> _queue = new();
+        private readonly BlockingCollection<(SendOrPostCallback Callback, object? State)> _queue = [];
 
         public override void Post(SendOrPostCallback d, object? state) => _queue.Add((d, state));
 
@@ -1024,7 +1026,7 @@ public sealed class AsyncLockTests
 
     private sealed class SingleThreadTaskScheduler : TaskScheduler, IDisposable
     {
-        private readonly BlockingCollection<Task> _tasks = new();
+        private readonly BlockingCollection<Task> _tasks = [];
         private readonly Thread _thread;
 
         public SingleThreadTaskScheduler()
